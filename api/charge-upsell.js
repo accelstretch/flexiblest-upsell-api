@@ -1,99 +1,167 @@
 export default async function handler(req, res) {
-  try {
-    if (req.method !== "POST") {
-      return res.status(405).json({ ok: false });
-    }
+  const allowedOrigin = process.env.APP_BASE_URL || "";
+  const origin = req.headers.origin || "";
 
-    const body = typeof req.body === "string"
-      ? JSON.parse(req.body || "{}")
-      : req.body || {};
+  if (origin === allowedOrigin) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+  }
 
-    const customerId = String(body.paddle_customer_id || "").trim();
-    const rootTxnId = String(body.root_txn_id || "").trim();
-    const priceId = String(body.price_id || "").trim();
+  res.setHeader("Vary", "Origin");
+  res.setHeader("Access-Control-Allow-Methods", "POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 
-    if (!priceId) {
-      return res.status(400).json({
-        ok: false,
-        error: "Missing price_id"
-      });
-    }
+  if (req.method === "OPTIONS") return res.status(200).end();
 
-    // fallback if no valid customer
-    if (!customerId || !customerId.startsWith("ctm_")) {
-      return res.status(200).json({
-        ok: true,
-        fallback: true
-      });
-    }
+  if (req.method !== "POST") {
+    return res.status(405).json({ ok: false });
+  }
 
-    // get saved payment methods
-    const methodsRes = await fetch(`https://api.paddle.com/customers/${customerId}/payment-methods`, {
-      method: "GET",
+  const PADDLE_API_BASE = "https://api.paddle.com";
+
+  async function paddleFetch(path, options = {}) {
+    return fetch(PADDLE_API_BASE + path, {
+      ...options,
       headers: {
-        "Authorization": `Bearer ${process.env.PADDLE_API_KEY}`,
-        "Content-Type": "application/json"
+        Authorization: `Bearer ${process.env.PADDLE_API_KEY}`,
+        "Content-Type": "application/json",
+        ...(options.headers || {})
       }
     });
+  }
 
+  async function getTransaction(txnId) {
+    if (!txnId || !txnId.startsWith("txn_")) return null;
+
+    const r = await paddleFetch(`/transactions/${txnId}`, { method: "GET" });
+    const d = await r.json();
+
+    if (!r.ok) return null;
+    return d?.data || null;
+  }
+
+  async function getCustomerIdFromEmail(email) {
+    if (!email) return "";
+
+    const r = await paddleFetch(`/customers?email=${encodeURIComponent(email)}`, {
+      method: "GET"
+    });
+    const d = await r.json();
+
+    if (!r.ok) return "";
+
+    const customers = Array.isArray(d?.data) ? d.data : [];
+    const exact = customers.find(
+      c => String(c?.email || "").toLowerCase() === email
+    );
+
+    return exact?.id || customers[0]?.id || "";
+  }
+
+  try {
+    const body =
+      typeof req.body === "string" ? JSON.parse(req.body || "{}") : req.body || {};
+
+    const submittedCustomerId = String(body.paddle_customer_id || "").trim();
+    const rootTxnId = String(body.root_txn_id || "").trim();
+    const accessEmail = String(body.access_email || "").trim().toLowerCase();
+    const priceId = String(body.price_id || "").trim();
+
+    if (!priceId || !priceId.startsWith("pri_")) {
+      return res.status(400).json({
+        ok: false,
+        error: "Missing or invalid price_id"
+      });
+    }
+
+    const rootTxn = await getTransaction(rootTxnId);
+
+    let customerId = submittedCustomerId;
+    if (!customerId || !customerId.startsWith("ctm_")) {
+      customerId = rootTxn?.customer_id || "";
+    }
+
+    if (!customerId || !customerId.startsWith("ctm_")) {
+      customerId = await getCustomerIdFromEmail(accessEmail);
+    }
+
+    const addressId = rootTxn?.address_id || "";
+
+    if (!customerId || !customerId.startsWith("ctm_") || !addressId || !addressId.startsWith("add_")) {
+      return res.status(200).json({
+        ok: true,
+        fallback: true,
+        reason: "missing_customer_or_address",
+        customer_id: customerId || "",
+        address_id: addressId || ""
+      });
+    }
+
+    const methodsRes = await paddleFetch(`/customers/${customerId}/payment-methods`, {
+      method: "GET"
+    });
     const methodsData = await methodsRes.json();
 
     if (!methodsRes.ok) {
       return res.status(200).json({
         ok: true,
-        fallback: true
+        fallback: true,
+        reason: "payment_methods_lookup_failed",
+        raw: methodsData
       });
     }
 
     const methods = Array.isArray(methodsData?.data) ? methodsData.data : [];
-    const active = methods.find(m => m.status === "active");
+    const activeMethod = methods.find(m => m && m.status === "active") || null;
 
-    if (!active) {
+    if (!activeMethod) {
       return res.status(200).json({
         ok: true,
-        fallback: true
+        fallback: true,
+        reason: "no_saved_payment_method",
+        customer_id: customerId,
+        address_id: addressId
       });
     }
 
-    // 🔥 CREATE TRANSACTION (TRUE 1-CLICK)
-    const txnRes = await fetch(`https://api.paddle.com/transactions`, {
+    const txnRes = await paddleFetch(`/transactions`, {
       method: "POST",
-      headers: {
-        "Authorization": `Bearer ${process.env.PADDLE_API_KEY}`,
-        "Content-Type": "application/json"
-      },
       body: JSON.stringify({
-        items: [
-          {
-            price_id: priceId,
-            quantity: 1
-          }
-        ],
+        items: [{ price_id: priceId, quantity: 1 }],
         customer_id: customerId,
-        collection_mode: "automatic"
+        address_id: addressId,
+        collection_mode: "automatic",
+        custom_data: body.custom_data || {}
       })
     });
 
     const txnData = await txnRes.json();
+    const txn = txnData?.data || {};
+    const status = txn?.status || "";
 
     if (!txnRes.ok) {
       return res.status(200).json({
         ok: true,
         fallback: true,
-        error: txnData
+        reason: "transaction_create_failed",
+        raw: txnData
       });
     }
 
     return res.status(200).json({
       ok: true,
-      charged: true,
-      transaction_id: txnData?.data?.id || ""
+      charged: status === "completed",
+      fallback: status !== "completed",
+      transaction_id: txn.id || "",
+      transaction_status: status,
+      checkout_url: txn?.checkout?.url || "",
+      customer_id: customerId,
+      address_id: addressId,
+      saved_payment_method_id: activeMethod.id || ""
     });
-
   } catch (err) {
     return res.status(500).json({
       ok: false,
-      error: err.message
+      error: err.message || "Server error"
     });
   }
 }
