@@ -45,8 +45,8 @@ export default async function handler(req, res) {
     const r = await paddleFetch(`/customers?email=${encodeURIComponent(email)}`, {
       method: "GET"
     });
-    const d = await r.json();
 
+    const d = await r.json();
     if (!r.ok) return "";
 
     const customers = Array.isArray(d?.data) ? d.data : [];
@@ -55,6 +55,22 @@ export default async function handler(req, res) {
     );
 
     return exact?.id || customers[0]?.id || "";
+  }
+
+  async function getAddressIdFromCustomer(customerId) {
+    if (!customerId || !customerId.startsWith("ctm_")) return "";
+
+    const r = await paddleFetch(`/customers/${customerId}/addresses`, {
+      method: "GET"
+    });
+
+    const d = await r.json();
+    if (!r.ok) return "";
+
+    const addresses = Array.isArray(d?.data) ? d.data : [];
+    const active = addresses.find(a => a && a.status === "active");
+
+    return active?.id || addresses[0]?.id || "";
   }
 
   try {
@@ -84,7 +100,11 @@ export default async function handler(req, res) {
       customerId = await getCustomerIdFromEmail(accessEmail);
     }
 
-    const addressId = rootTxn?.address_id || "";
+    let addressId = rootTxn?.address_id || "";
+
+    if (!addressId || !addressId.startsWith("add_")) {
+      addressId = await getAddressIdFromCustomer(customerId);
+    }
 
     if (!customerId || !customerId.startsWith("ctm_") || !addressId || !addressId.startsWith("add_")) {
       return res.status(200).json({
@@ -99,6 +119,7 @@ export default async function handler(req, res) {
     const methodsRes = await paddleFetch(`/customers/${customerId}/payment-methods`, {
       method: "GET"
     });
+
     const methodsData = await methodsRes.json();
 
     if (!methodsRes.ok) {
