@@ -10,15 +10,10 @@ export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Methods", "POST,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 
-  if (req.method === "OPTIONS") {
-    return res.status(200).end();
-  }
+  if (req.method === "OPTIONS") return res.status(200).end();
 
   if (req.method !== "POST") {
-    return res.status(405).json({
-      ok: false,
-      error: "Method not allowed"
-    });
+    return res.status(405).json({ ok: false, error: "Method not allowed" });
   }
 
   const PADDLE_API_BASE = "https://api.paddle.com";
@@ -34,20 +29,17 @@ export default async function handler(req, res) {
     });
   }
 
-  async function getCustomerIdFromTransaction(transactionId) {
-    if (!transactionId || !transactionId.startsWith("txn_")) return "";
+  async function getCustomerFromTransaction(transactionId) {
+    if (!transactionId || !transactionId.startsWith("txn_")) return null;
 
     const response = await paddleFetch(`/transactions/${transactionId}`, {
       method: "GET"
     });
 
     const data = await response.json();
+    if (!response.ok) return null;
 
-    if (!response.ok) {
-      return "";
-    }
-
-    return data?.data?.customer_id || "";
+    return data?.data || null;
   }
 
   async function getCustomerIdFromEmail(email) {
@@ -59,14 +51,11 @@ export default async function handler(req, res) {
     );
 
     const data = await response.json();
-
-    if (!response.ok) {
-      return "";
-    }
+    if (!response.ok) return "";
 
     const customers = Array.isArray(data?.data) ? data.data : [];
     const exact = customers.find(
-      (c) => String(c?.email || "").toLowerCase() === email
+      c => String(c?.email || "").toLowerCase() === email
     );
 
     return exact?.id || customers[0]?.id || "";
@@ -74,18 +63,18 @@ export default async function handler(req, res) {
 
   try {
     const body =
-      typeof req.body === "string"
-        ? JSON.parse(req.body || "{}")
-        : req.body || {};
+      typeof req.body === "string" ? JSON.parse(req.body || "{}") : req.body || {};
 
     const submittedCustomerId = String(body.paddle_customer_id || "").trim();
     const accessEmail = String(body.access_email || "").trim().toLowerCase();
     const rootTxnId = String(body.root_txn_id || "").trim();
 
+    const rootTxn = await getCustomerFromTransaction(rootTxnId);
+
     let customerId = submittedCustomerId;
 
     if (!customerId || !customerId.startsWith("ctm_")) {
-      customerId = await getCustomerIdFromTransaction(rootTxnId);
+      customerId = rootTxn?.customer_id || "";
     }
 
     if (!customerId || !customerId.startsWith("ctm_")) {
@@ -106,8 +95,7 @@ export default async function handler(req, res) {
 
     const [authResponse, methodsResponse] = await Promise.all([
       paddleFetch(`/customers/${customerId}/auth-token`, {
-        method: "POST",
-        body: JSON.stringify({})
+        method: "POST"
       }),
       paddleFetch(`/customers/${customerId}/payment-methods`, {
         method: "GET"
@@ -134,7 +122,7 @@ export default async function handler(req, res) {
     }
 
     const methods = Array.isArray(methodsData?.data) ? methodsData.data : [];
-    const activeMethods = methods.filter((m) => m && m.status === "active");
+    const activeMethods = methods.filter(m => m && m.status === "active");
     const bestMethod = activeMethods[0] || null;
 
     return res.status(200).json({
@@ -152,6 +140,7 @@ export default async function handler(req, res) {
       saved_payment_method: bestMethod,
       access_email: accessEmail,
       root_txn_id: rootTxnId,
+      root_address_id: rootTxn?.address_id || "",
       final_thank_you_url: process.env.FINAL_THANK_YOU_URL || ""
     });
   } catch (err) {
