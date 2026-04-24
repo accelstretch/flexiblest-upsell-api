@@ -6,6 +6,7 @@ export default async function handler(req, res) {
     res.setHeader("Access-Control-Allow-Origin", origin);
   }
 
+  res.setHeader("Vary", "Origin");
   res.setHeader("Access-Control-Allow-Methods", "POST,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 
@@ -20,37 +21,96 @@ export default async function handler(req, res) {
     });
   }
 
-  try {
-    const body = typeof req.body === "string"
-      ? JSON.parse(req.body || "{}")
-      : req.body || {};
+  const PADDLE_API_BASE = "https://api.paddle.com";
 
-    const customerId = String(body.paddle_customer_id || "").trim();
+  async function paddleFetch(path, options = {}) {
+    return fetch(PADDLE_API_BASE + path, {
+      ...options,
+      headers: {
+        Authorization: `Bearer ${process.env.PADDLE_API_KEY}`,
+        "Content-Type": "application/json",
+        ...(options.headers || {})
+      }
+    });
+  }
+
+  async function getCustomerIdFromTransaction(transactionId) {
+    if (!transactionId || !transactionId.startsWith("txn_")) return "";
+
+    const response = await paddleFetch(`/transactions/${transactionId}`, {
+      method: "GET"
+    });
+
+    const data = await response.json();
+
+    if (!response.ok) {
+      return "";
+    }
+
+    return data?.data?.customer_id || "";
+  }
+
+  async function getCustomerIdFromEmail(email) {
+    if (!email) return "";
+
+    const response = await paddleFetch(
+      `/customers?email=${encodeURIComponent(email)}`,
+      { method: "GET" }
+    );
+
+    const data = await response.json();
+
+    if (!response.ok) {
+      return "";
+    }
+
+    const customers = Array.isArray(data?.data) ? data.data : [];
+    const exact = customers.find(
+      (c) => String(c?.email || "").toLowerCase() === email
+    );
+
+    return exact?.id || customers[0]?.id || "";
+  }
+
+  try {
+    const body =
+      typeof req.body === "string"
+        ? JSON.parse(req.body || "{}")
+        : req.body || {};
+
+    const submittedCustomerId = String(body.paddle_customer_id || "").trim();
     const accessEmail = String(body.access_email || "").trim().toLowerCase();
     const rootTxnId = String(body.root_txn_id || "").trim();
+
+    let customerId = submittedCustomerId;
+
+    if (!customerId || !customerId.startsWith("ctm_")) {
+      customerId = await getCustomerIdFromTransaction(rootTxnId);
+    }
+
+    if (!customerId || !customerId.startsWith("ctm_")) {
+      customerId = await getCustomerIdFromEmail(accessEmail);
+    }
 
     if (!customerId || !customerId.startsWith("ctm_")) {
       return res.status(400).json({
         ok: false,
-        error: "Invalid paddle_customer_id"
+        error: "Unable to resolve Paddle customer",
+        received: {
+          submitted_customer_id: submittedCustomerId,
+          access_email: accessEmail,
+          root_txn_id: rootTxnId
+        }
       });
     }
 
     const [authResponse, methodsResponse] = await Promise.all([
-      fetch(`https://api.paddle.com/customers/${customerId}/auth-token`, {
+      paddleFetch(`/customers/${customerId}/auth-token`, {
         method: "POST",
-        headers: {
-          "Authorization": `Bearer ${process.env.PADDLE_API_KEY}`,
-          "Content-Type": "application/json"
-        },
         body: JSON.stringify({})
       }),
-      fetch(`https://api.paddle.com/customers/${customerId}/payment-methods`, {
-        method: "GET",
-        headers: {
-          "Authorization": `Bearer ${process.env.PADDLE_API_KEY}`,
-          "Content-Type": "application/json"
-        }
+      paddleFetch(`/customers/${customerId}/payment-methods`, {
+        method: "GET"
       })
     ]);
 
@@ -81,7 +141,10 @@ export default async function handler(req, res) {
       ok: true,
       paddle_client_token: process.env.PADDLE_CLIENT_TOKEN || "",
       paddle_customer_id: customerId,
-      customer_auth_token: authData?.data?.token || "",
+      customer_auth_token:
+        authData?.data?.customer_auth_token ||
+        authData?.data?.token ||
+        "",
       expires_at: authData?.data?.expires_at || "",
       saved_payment_methods: methods,
       saved_payment_methods_count: methods.length,
