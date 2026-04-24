@@ -13,7 +13,7 @@ export default async function handler(req, res) {
   if (req.method === "OPTIONS") return res.status(200).end();
 
   if (req.method !== "POST") {
-    return res.status(405).json({ ok: false });
+    return res.status(405).json({ ok: false, error: "Method not allowed" });
   }
 
   const PADDLE_API_BASE = "https://api.paddle.com";
@@ -57,6 +57,26 @@ export default async function handler(req, res) {
     return exact?.id || customers[0]?.id || "";
   }
 
+  async function getLatestCompletedTransactionForCustomer(customerId) {
+    if (!customerId || !customerId.startsWith("ctm_")) return null;
+
+    const r = await paddleFetch(
+      `/transactions?customer_id=${encodeURIComponent(customerId)}&status=completed&per_page=20`,
+      { method: "GET" }
+    );
+
+    const d = await r.json();
+    if (!r.ok) return null;
+
+    const txns = Array.isArray(d?.data) ? d.data : [];
+
+    const withAddress = txns.find(
+      t => t && t.id && t.status === "completed" && t.address_id
+    );
+
+    return withAddress || txns[0] || null;
+  }
+
   async function getAddressIdFromCustomer(customerId) {
     if (!customerId || !customerId.startsWith("ctm_")) return "";
 
@@ -92,6 +112,7 @@ export default async function handler(req, res) {
     const rootTxn = await getTransaction(rootTxnId);
 
     let customerId = submittedCustomerId;
+
     if (!customerId || !customerId.startsWith("ctm_")) {
       customerId = rootTxn?.customer_id || "";
     }
@@ -100,7 +121,16 @@ export default async function handler(req, res) {
       customerId = await getCustomerIdFromEmail(accessEmail);
     }
 
-    let addressId = rootTxn?.address_id || "";
+    let fallbackTxn = null;
+
+    if (customerId && customerId.startsWith("ctm_")) {
+      fallbackTxn = await getLatestCompletedTransactionForCustomer(customerId);
+    }
+
+    let addressId =
+      rootTxn?.address_id ||
+      fallbackTxn?.address_id ||
+      "";
 
     if (!addressId || !addressId.startsWith("add_")) {
       addressId = await getAddressIdFromCustomer(customerId);
@@ -109,10 +139,13 @@ export default async function handler(req, res) {
     if (!customerId || !customerId.startsWith("ctm_") || !addressId || !addressId.startsWith("add_")) {
       return res.status(200).json({
         ok: true,
+        charged: false,
         fallback: true,
         reason: "missing_customer_or_address",
         customer_id: customerId || "",
-        address_id: addressId || ""
+        address_id: addressId || "",
+        root_txn_id: rootTxnId || "",
+        fallback_txn_id: fallbackTxn?.id || ""
       });
     }
 
@@ -125,6 +158,7 @@ export default async function handler(req, res) {
     if (!methodsRes.ok) {
       return res.status(200).json({
         ok: true,
+        charged: false,
         fallback: true,
         reason: "payment_methods_lookup_failed",
         raw: methodsData
@@ -137,6 +171,7 @@ export default async function handler(req, res) {
     if (!activeMethod) {
       return res.status(200).json({
         ok: true,
+        charged: false,
         fallback: true,
         reason: "no_saved_payment_method",
         customer_id: customerId,
@@ -162,6 +197,7 @@ export default async function handler(req, res) {
     if (!txnRes.ok) {
       return res.status(200).json({
         ok: true,
+        charged: false,
         fallback: true,
         reason: "transaction_create_failed",
         raw: txnData
@@ -177,7 +213,9 @@ export default async function handler(req, res) {
       checkout_url: txn?.checkout?.url || "",
       customer_id: customerId,
       address_id: addressId,
-      saved_payment_method_id: activeMethod.id || ""
+      saved_payment_method_id: activeMethod.id || "",
+      root_txn_id: rootTxnId || "",
+      fallback_txn_id: fallbackTxn?.id || ""
     });
   } catch (err) {
     return res.status(500).json({
