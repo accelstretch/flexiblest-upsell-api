@@ -93,6 +93,17 @@ export default async function handler(req, res) {
     return active?.id || addresses[0]?.id || "";
   }
 
+  function pickUsablePaymentMethod(methods) {
+    if (!Array.isArray(methods) || methods.length === 0) return null;
+
+    return (
+      methods.find(m => m && (m.status === "active" || !m.status)) ||
+      methods.find(m => m && m.id) ||
+      methods[0] ||
+      null
+    );
+  }
+
   try {
     const body =
       typeof req.body === "string" ? JSON.parse(req.body || "{}") : req.body || {};
@@ -161,21 +172,25 @@ export default async function handler(req, res) {
         charged: false,
         fallback: true,
         reason: "payment_methods_lookup_failed",
+        customer_id: customerId,
+        address_id: addressId,
         raw: methodsData
       });
     }
 
     const methods = Array.isArray(methodsData?.data) ? methodsData.data : [];
-    const activeMethod = methods.find(m => m && m.status === "active") || null;
+    const activeMethod = pickUsablePaymentMethod(methods);
 
-    if (!activeMethod) {
+    if (!activeMethod || !activeMethod.id) {
       return res.status(200).json({
         ok: true,
         charged: false,
         fallback: true,
         reason: "no_saved_payment_method",
         customer_id: customerId,
-        address_id: addressId
+        address_id: addressId,
+        saved_payment_methods_count: methods.length,
+        saved_payment_methods: methods
       });
     }
 
@@ -200,6 +215,9 @@ export default async function handler(req, res) {
         charged: false,
         fallback: true,
         reason: "transaction_create_failed",
+        customer_id: customerId,
+        address_id: addressId,
+        saved_payment_method_id: activeMethod.id || "",
         raw: txnData
       });
     }
@@ -214,6 +232,7 @@ export default async function handler(req, res) {
       customer_id: customerId,
       address_id: addressId,
       saved_payment_method_id: activeMethod.id || "",
+      saved_payment_methods_count: methods.length,
       root_txn_id: rootTxnId || "",
       fallback_txn_id: fallbackTxn?.id || ""
     });
