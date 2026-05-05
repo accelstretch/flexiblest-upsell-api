@@ -1,10 +1,13 @@
 export default async function handler(req, res) {
   if (req.method !== "POST") {
-    return res.status(200).json({ ok: true, message: "PayPro webhook endpoint active" });
+    return res.status(200).json({
+      ok: true,
+      message: "PayPro webhook endpoint active"
+    });
   }
 
   try {
-    const raw = req.body || {};
+    const raw = typeof req.body === "string" ? req.body : req.body || {};
     const data = typeof raw === "string" ? parseFormBody(raw) : raw;
 
     const sku = clean(data.ORDER_ITEM_SKU);
@@ -12,12 +15,36 @@ export default async function handler(req, res) {
     const testMode = clean(data.TEST_MODE) === "1";
 
     const productMap = {
-      "FS-AS-29": { kajabi_id: "ADD_KAJABI_ID", name: "AccelStretch System", type: "main" },
-      "FS-CHARTS-17": { kajabi_id: "ADD_KAJABI_ID", name: "Printable Routine Charts", type: "bump" },
-      "FS-JOINT-12": { kajabi_id: "ADD_KAJABI_ID", name: "Joint Support Nutrition Plan", type: "bump" },
-      "FS-FTREC-UP57": { kajabi_id: "ADD_KAJABI_ID", name: "Fast Track Body Recovery System", type: "upsell" },
-      "FS-FTREC-DS37": { kajabi_id: "ADD_KAJABI_ID", name: "Fast Track Body Recovery Final Offer", type: "downsell" },
-      "FS-BODYPLAN-27": { kajabi_id: "ADD_KAJABI_ID", name: "21-Day Body Transformation Plan", type: "upsell" }
+      "FS-AS-29": {
+        kajabi_id: "ADD_KAJABI_ID",
+        name: "AccelStretch System",
+        type: "main"
+      },
+      "FS-CHARTS-17": {
+        kajabi_id: "ADD_KAJABI_ID",
+        name: "Printable Routine Charts",
+        type: "bump"
+      },
+      "FS-JOINT-12": {
+        kajabi_id: "ADD_KAJABI_ID",
+        name: "Joint Support Nutrition Plan",
+        type: "bump"
+      },
+      "FS-FTREC-UP57": {
+        kajabi_id: "ADD_KAJABI_ID",
+        name: "Fast Track Body Recovery System",
+        type: "upsell"
+      },
+      "FS-FTREC-DS37": {
+        kajabi_id: "ADD_KAJABI_ID",
+        name: "Fast Track Body Recovery Final Offer",
+        type: "downsell"
+      },
+      "FS-BODYPLAN-27": {
+        kajabi_id: "ADD_KAJABI_ID",
+        name: "21-Day Body Transformation Plan",
+        type: "upsell"
+      }
     };
 
     const mapped = productMap[sku] || {};
@@ -53,25 +80,44 @@ export default async function handler(req, res) {
 
       kajabi_id: mapped.kajabi_id || "",
       raw_custom_fields: clean(data.ORDER_CUSTOM_FIELDS),
-      checkout_query_string: clean(data.CHECKOUT_QUERY_STRING)
+      checkout_query_string: clean(data.CHECKOUT_QUERY_STRING),
+
+      order_status: clean(data.ORDER_STATUS),
+      order_status_id: clean(data.ORDER_STATUS_ID),
+      ipn_type_id: clean(data.IPN_TYPE_ID),
+      product_quantity: number(data.PRODUCT_QUANTITY),
+      order_items_count: number(data.ORDER_ITEMS_COUNT),
+      bundled_items_count: number(data.BUNDLED_ITEMS_COUNT)
     };
 
     console.log("PAYPRO_NORMALIZED", JSON.stringify(normalized));
 
-    // 1) Send to Cometly later, once API key/field format is confirmed
     if (process.env.COMETLY_API_KEY && process.env.COMETLY_EVENT_URL) {
       await sendToCometly(normalized);
     }
 
-    // 2) Send to Zapier/Kajabi access automation later
-    if (process.env.ZAPIER_PAYPRO_ACCESS_WEBHOOK_URL && normalized.kajabi_id) {
+    if (
+      process.env.ZAPIER_PAYPRO_ACCESS_WEBHOOK_URL &&
+      normalized.kajabi_id &&
+      normalized.kajabi_id !== "ADD_KAJABI_ID"
+    ) {
       await sendToZapier(normalized);
     }
 
-    return res.status(200).json({ ok: true, received: true, sku, event_type: eventType });
+    return res.status(200).json({
+      ok: true,
+      received: true,
+      sku,
+      event_type: eventType,
+      test_mode: testMode
+    });
   } catch (err) {
     console.error("PAYPRO_WEBHOOK_ERROR", err);
-    return res.status(500).json({ ok: false, error: err.message });
+
+    return res.status(500).json({
+      ok: false,
+      error: err.message
+    });
   }
 }
 
@@ -87,14 +133,18 @@ function number(v) {
 function parseFormBody(body) {
   const params = new URLSearchParams(body);
   const obj = {};
-  for (const [key, value] of params.entries()) obj[key] = value;
+  for (const [key, value] of params.entries()) {
+    obj[key] = value;
+  }
   return obj;
 }
 
 async function sendToZapier(payload) {
   await fetch(process.env.ZAPIER_PAYPRO_ACCESS_WEBHOOK_URL, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json"
+    },
     body: JSON.stringify(payload)
   });
 }
@@ -118,7 +168,10 @@ async function sendToCometly(payload) {
       product_type: payload.product_type,
       payment_method: payload.payment_method,
       country: payload.country,
-      test_mode: payload.test_mode
+      test_mode: payload.test_mode,
+      order_status: payload.order_status,
+      order_status_id: payload.order_status_id,
+      ipn_type_id: payload.ipn_type_id
     }
   };
 
@@ -126,7 +179,7 @@ async function sendToCometly(payload) {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "Authorization": `Bearer ${process.env.COMETLY_API_KEY}`
+      Authorization: `Bearer ${process.env.COMETLY_API_KEY}`
     },
     body: JSON.stringify(cometlyPayload)
   });
