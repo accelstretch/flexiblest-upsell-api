@@ -22,21 +22,21 @@ export default async function handler(req, res) {
   const PADDLE_API_BASE = "https://api.paddle.com";
 
   const ALLOWED_PRICES = {
-    pri_01km6qnwdtqtzk9wx590qgkrgs: {
-      code: "FS-AS-MAIN",
-      name: "AccelStretch Main"
+    "pri_01kq0sap0vx78bkgfs5m1b3q7z": {
+      code: "39-AS-MAIN",
+      name: "AccelStretch"
     },
-    pri_01kpa2zcfpv2f3szmnq8edy1d2: {
-      code: "FS-JS-BUMP-AS1",
-      name: "Joint Nutrition Plan"
+    "pri_01kq4je7258mrqgasxsazyw3tr": {
+      code: "AS-CMS-BUMP47",
+      name: "Body Recovery System"
     },
-    pri_01km76m0tpd57vzdf9vqxxgepd: {
-      code: "FS-AC-BUMP-AS1",
-      name: "AccelCore Strength"
+    "pri_01kq4jtdnfqvmxx244g75sqyvq": {
+      code: "AS-FFT-BUMP17",
+      name: "Flexibility Fast Track"
     }
   };
 
-  const MAIN_PRICE_ID = "pri_01km6qnwdtqtzk9wx590qgkrgs";
+  const MAIN_PRICE_ID = "pri_01kq0sap0vx78bkgfs5m1b3q7z";
 
   async function paddleFetch(path, options = {}) {
     return fetch(PADDLE_API_BASE + path, {
@@ -170,10 +170,13 @@ export default async function handler(req, res) {
       items: items,
       collection_mode: "automatic",
       custom_data: {
+        processor: "paddle",
+        funnel: "accelstretch_paddle_order_bump_method",
         grant_email: accessEmail || "",
-        source_product: "accelstretch",
+        source_product: "accelstretch-system",
         offer_step: "checkout_main",
-        checkout_path: body.checkout_path || "",
+        checkout_path: body.checkout_path || "/checkout-accelstretch",
+        sales_page_path: body.sales_page_path || "/accelstretch-system",
         fs_session_id: body.fs_session_id || "",
         fs_checkout_intent_id: body.fs_checkout_intent_id || "",
         selected_price_ids: selectedPriceIds,
