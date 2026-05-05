@@ -18,6 +18,27 @@ export default async function handler(req, res) {
 
   const PADDLE_API_BASE = "https://api.paddle.com";
 
+  const ALLOWED_UPSELL_PRICES = {
+    "pri_01kq0waqtmz7fezc8rbb0474mg": {
+      code: "AS-CMS-BUMP37",
+      name: "Body Recovery Upgrade",
+      step: "mobility_upgrade",
+      path: "/mobility-upgrade"
+    },
+    "pri_01kq4nyf7mgtdtkx06he6658hz": {
+      code: "AS-ACCESS-ALL-AS",
+      name: "Full Library Access",
+      step: "full_access",
+      path: "/full-access"
+    },
+    "pri_01kq5nwdcb10v9zccnvqj5qv09": {
+      code: "AS-NUT-UPSL2",
+      name: "Complete Nutrition Upgrade",
+      step: "fuel_plan",
+      path: "/fuel-plan"
+    }
+  };
+
   async function paddleFetch(path, options = {}) {
     return fetch(PADDLE_API_BASE + path, {
       ...options,
@@ -120,6 +141,16 @@ export default async function handler(req, res) {
       });
     }
 
+    const offer = ALLOWED_UPSELL_PRICES[priceId];
+
+    if (!offer) {
+      return res.status(400).json({
+        ok: false,
+        error: "Price ID is not allowed for Paddle upsell charge",
+        received_price_id: priceId
+      });
+    }
+
     const rootTxn = await getTransaction(rootTxnId);
 
     let customerId = submittedCustomerId;
@@ -194,6 +225,20 @@ export default async function handler(req, res) {
       });
     }
 
+    const customData = {
+      processor: "paddle",
+      funnel: "accelstretch_paddle_order_bump_method",
+      source_product: "accelstretch-system",
+      offer_step: offer.step,
+      offer_path: offer.path,
+      offer_internal_code: offer.code,
+      offer_name: offer.name,
+      grant_email: accessEmail || "",
+      root_txn_id: rootTxnId || "",
+      root_customer_id: customerId || "",
+      ...(body.custom_data || {})
+    };
+
     const txnRes = await paddleFetch(`/transactions`, {
       method: "POST",
       body: JSON.stringify({
@@ -201,7 +246,7 @@ export default async function handler(req, res) {
         customer_id: customerId,
         address_id: addressId,
         collection_mode: "automatic",
-        custom_data: body.custom_data || {}
+        custom_data: customData
       })
     });
 
@@ -234,7 +279,11 @@ export default async function handler(req, res) {
       saved_payment_method_id: activeMethod.id || "",
       saved_payment_methods_count: methods.length,
       root_txn_id: rootTxnId || "",
-      fallback_txn_id: fallbackTxn?.id || ""
+      fallback_txn_id: fallbackTxn?.id || "",
+      offer_internal_code: offer.code,
+      offer_name: offer.name,
+      offer_step: offer.step,
+      offer_path: offer.path
     });
   } catch (err) {
     return res.status(500).json({
