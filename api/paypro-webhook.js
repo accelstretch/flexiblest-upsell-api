@@ -3,6 +3,8 @@ const COMETLY_API_URL = "https://app.cometly.com/public-api/v1/events/track";
 const MAIN_EVENT_NAME = "purchase";
 const UPSELL_EVENT_NAME = process.env.COMETLY_UPSELL_EVENT_NAME || "custom_event_1";
 
+const MAIN_CHECKOUT_PRODUCT_ID = "133559";
+
 const SECRET_QUERY_KEYS = [
   "secret-key",
   "secret_key",
@@ -92,8 +94,22 @@ function mergePayProData(raw) {
   };
 }
 
+function getOfferStep(data) {
+  return pick(data, ["x-offer_step", "offer_step", "OFFER_STEP"]).toLowerCase();
+}
+
+function isCheckoutMain(data) {
+  const step = getOfferStep(data);
+  return !step || step === "checkout_main";
+}
+
+function shouldSkipCheckoutBumpIpn(data) {
+  const productId = pick(data, ["PRODUCT_ID"]);
+  return isCheckoutMain(data) && productId && productId !== MAIN_CHECKOUT_PRODUCT_ID;
+}
+
 function isUpsell(data) {
-  const step = pick(data, ["x-offer_step", "offer_step", "OFFER_STEP"]).toLowerCase();
+  const step = getOfferStep(data);
   const sku = pick(data, ["ORDER_ITEM_SKU"]).toLowerCase();
   const productId = pick(data, ["PRODUCT_ID"]);
 
@@ -110,14 +126,29 @@ function isUpsell(data) {
   return ["133573", "133574", "133575"].includes(productId);
 }
 
-function getAmount(data) {
+function getCheckoutMainAmount(data) {
+  return (
+    num(data.ORDER_TOTAL_AMOUNT_SHOWN) ||
+    num(data.ORDER_TOTAL_AMOUNT_WITH_TAXES_SHOWN) ||
+    num(data.ORDER_TOTAL_BALANCE_CURRENCY_AMOUNT) ||
+    num(data.ORDER_ITEM_BALANCE_CURRENCY_TOTAL_AMOUNT) ||
+    num(data.ORDER_ITEM_TOTAL_AMOUNT)
+  );
+}
+
+function getItemAmount(data) {
   return (
     num(data.ORDER_ITEM_BALANCE_CURRENCY_TOTAL_AMOUNT) ||
-    num(data.ORDER_TOTAL_BALANCE_CURRENCY_AMOUNT) ||
     num(data.ORDER_ITEM_TOTAL_AMOUNT) ||
+    num(data.ORDER_TOTAL_BALANCE_CURRENCY_AMOUNT) ||
     num(data.ORDER_TOTAL_AMOUNT_SHOWN) ||
     num(data.ORDER_TOTAL_AMOUNT_WITH_TAXES_SHOWN)
   );
+}
+
+function getAmount(data) {
+  if (isCheckoutMain(data)) return getCheckoutMainAmount(data);
+  return getItemAmount(data);
 }
 
 function getCurrency(data) {
@@ -256,6 +287,9 @@ export default async function handler(req, res) {
     const data = mergePayProData(raw);
     const status = pick(data, ["ORDER_STATUS"]);
     const ipnType = pick(data, ["IPN_TYPE_NAME"]);
+    const productId = pick(data, ["PRODUCT_ID"]);
+    const orderId = pick(data, ["ORDER_ID"]);
+    const itemId = pick(data, ["ORDER_ITEM_ID"]);
 
     if (status && status !== "Processed") {
       return res.status(200).json({ ok: true, skipped: "Non processed order" });
@@ -263,6 +297,26 @@ export default async function handler(req, res) {
 
     if (ipnType && ipnType !== "OrderCharged") {
       return res.status(200).json({ ok: true, skipped: "Non charge IPN" });
+    }
+
+    if (shouldSkipCheckoutBumpIpn(data)) {
+      console.log("PAYPRO CHECKOUT BUMP IPN SKIPPED:", {
+        ORDER_ID: orderId,
+        PRODUCT_ID: productId,
+        ORDER_ITEM_ID: itemId,
+        ORDER_ITEM_NAME: data.ORDER_ITEM_NAME,
+        ORDER_ITEM_SKU: data.ORDER_ITEM_SKU
+      });
+
+      return res.status(200).json({
+        ok: true,
+        sent_to_cometly: false,
+        skipped: true,
+        reason: "checkout_bump_item_ipn_skipped",
+        order_id: orderId,
+        product_id: productId,
+        item_id: itemId
+      });
     }
 
     const event = buildEvent(raw, req);
