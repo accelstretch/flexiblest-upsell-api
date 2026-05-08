@@ -128,6 +128,7 @@ function isUpsell(data) {
 
 function getCheckoutMainAmount(data) {
   return (
+    num(pick(data, ["x-total", "total"])) ||
     num(data.ORDER_TOTAL_AMOUNT_SHOWN) ||
     num(data.ORDER_TOTAL_AMOUNT_WITH_TAXES_SHOWN) ||
     num(data.ORDER_TOTAL_BALANCE_CURRENCY_AMOUNT) ||
