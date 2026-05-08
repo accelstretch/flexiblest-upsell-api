@@ -1,100 +1,239 @@
 const COMETLY_API_URL = "https://app.cometly.com/public-api/v1/events/track";
 
+const MAIN_EVENT_NAME = "purchase";
+const UPSELL_EVENT_NAME = process.env.COMETLY_UPSELL_EVENT_NAME || "custom_event_1";
+
+const SECRET_QUERY_KEYS = [
+  "secret-key",
+  "secret_key",
+  "key",
+  "hash",
+  "signature"
+];
+
+const PII_QUERY_KEYS_TO_MASK = [
+  "billing-email",
+  "x-grant_email",
+  "x-kajabi_email",
+  "email"
+];
+
+function safeString(value) {
+  return String(value ?? "").trim();
+}
+
 function pick(obj, keys) {
   for (const key of keys) {
-    if (obj && obj[key] !== undefined && obj[key] !== null && String(obj[key]).trim() !== "") {
-      return String(obj[key]).trim();
+    const value = obj?.[key];
+    if (value !== undefined && value !== null && safeString(value) !== "") {
+      return safeString(value);
     }
   }
   return "";
 }
 
 function num(value) {
-  const n = parseFloat(String(value || "0").replace(",", "."));
+  const n = parseFloat(safeString(value).replace(",", "."));
   return Number.isFinite(n) ? n : 0;
 }
 
-function isUpsell(raw) {
-  const step = pick(raw, ["x-offer_step", "offer_step", "OFFER_STEP"]).toLowerCase();
-  const sku = pick(raw, ["ORDER_ITEM_SKU"]).toLowerCase();
-  const productId = pick(raw, ["PRODUCT_ID"]);
+function maskEmail(email) {
+  const clean = safeString(email);
+  if (!clean || !clean.includes("@")) return clean;
+  const [name, domain] = clean.split("@");
+  return `${name.slice(0, 2)}***@${domain}`;
+}
 
-  if (step.includes("upsell") || step.includes("downsell") || step.includes("fast_track") || step.includes("bodyplan")) return true;
-  if (sku.includes("upsl") || sku.includes("upsell") || sku.includes("downsell")) return true;
+function parseQueryString(qs) {
+  const out = {};
+  const query = safeString(qs).replace(/^\?/, "");
+  if (!query) return out;
+
+  try {
+    const params = new URLSearchParams(query);
+    params.forEach((value, key) => {
+      out[key] = value;
+      if (key.startsWith("x-")) {
+        out[key.slice(2)] = value;
+      }
+    });
+  } catch (e) {}
+
+  return out;
+}
+
+function sanitizeQueryString(qs) {
+  const query = safeString(qs).replace(/^\?/, "");
+  if (!query) return "";
+
+  try {
+    const params = new URLSearchParams(query);
+
+    SECRET_QUERY_KEYS.forEach((key) => {
+      if (params.has(key)) params.set(key, "[removed]");
+    });
+
+    PII_QUERY_KEYS_TO_MASK.forEach((key) => {
+      if (params.has(key)) params.set(key, maskEmail(params.get(key)));
+    });
+
+    return params.toString();
+  } catch (e) {
+    return "[unparseable_query_string]";
+  }
+}
+
+function mergePayProData(raw) {
+  const queryData = parseQueryString(raw?.CHECKOUT_QUERY_STRING || "");
+  return {
+    ...queryData,
+    ...raw,
+    _query: queryData
+  };
+}
+
+function isUpsell(data) {
+  const step = pick(data, ["x-offer_step", "offer_step", "OFFER_STEP"]).toLowerCase();
+  const sku = pick(data, ["ORDER_ITEM_SKU"]).toLowerCase();
+  const productId = pick(data, ["PRODUCT_ID"]);
+
+  if (step.includes("upsell")) return true;
+  if (step.includes("downsell")) return true;
+  if (step.includes("fast_track")) return true;
+  if (step.includes("complete_fast_track")) return true;
+  if (step.includes("fast-track")) return true;
+  if (step.includes("bodyplan")) return true;
+  if (sku.includes("upsl")) return true;
+  if (sku.includes("upsell")) return true;
+  if (sku.includes("downsell")) return true;
 
   return ["133573", "133574", "133575"].includes(productId);
 }
 
+function getAmount(data) {
+  return (
+    num(data.ORDER_ITEM_BALANCE_CURRENCY_TOTAL_AMOUNT) ||
+    num(data.ORDER_TOTAL_BALANCE_CURRENCY_AMOUNT) ||
+    num(data.ORDER_ITEM_TOTAL_AMOUNT) ||
+    num(data.ORDER_TOTAL_AMOUNT_SHOWN) ||
+    num(data.ORDER_TOTAL_AMOUNT_WITH_TAXES_SHOWN)
+  );
+}
+
+function getCurrency(data) {
+  return (
+    pick(data, ["VENDOR_BALANCE_CURRENCY_CODE"]) ||
+    pick(data, ["ORDER_CURRENCY_CODE"]) ||
+    "USD"
+  );
+}
+
+function getEventTime(data) {
+  const raw = pick(data, ["ORDER_PLACED_TIME_UTC"]);
+  if (!raw) return new Date().toISOString();
+
+  const parsed = new Date(raw + " UTC");
+  if (Number.isNaN(parsed.getTime())) return new Date().toISOString();
+
+  return parsed.toISOString();
+}
+
 function buildEvent(raw, req) {
-  const orderId = pick(raw, ["ORDER_ID"]);
-  const itemId = pick(raw, ["ORDER_ITEM_ID"]);
-  const productId = pick(raw, ["PRODUCT_ID"]);
-  const email = pick(raw, ["CUSTOMER_EMAIL", "x-grant_email", "x-kajabi_email"]);
-  const upsell = isUpsell(raw);
+  const data = mergePayProData(raw);
 
-  const amount =
-    num(raw.ORDER_ITEM_BALANCE_CURRENCY_TOTAL_AMOUNT) ||
-    num(raw.ORDER_ITEM_TOTAL_AMOUNT) ||
-    num(raw.ORDER_TOTAL_AMOUNT_SHOWN) ||
-    num(raw.ORDER_TOTAL_AMOUNT_WITH_TAXES_SHOWN);
+  const orderId = pick(data, ["ORDER_ID"]);
+  const itemId = pick(data, ["ORDER_ITEM_ID"]);
+  const productId = pick(data, ["PRODUCT_ID"]);
+  const email = pick(data, ["CUSTOMER_EMAIL", "x-grant_email", "grant_email", "x-kajabi_email", "kajabi_email", "billing-email"]);
+  const upsell = isUpsell(data);
 
-  const currency =
-    pick(raw, ["VENDOR_BALANCE_CURRENCY_CODE"]) ||
-    pick(raw, ["ORDER_CURRENCY_CODE"]) ||
-    "USD";
-
-  const eventTimeRaw = pick(raw, ["ORDER_PLACED_TIME_UTC"]);
-  const eventTime = eventTimeRaw ? new Date(eventTimeRaw + " UTC").toISOString() : new Date().toISOString();
+  const sessionId = pick(data, ["x-fs_session_id", "fs_session_id"]);
+  const checkoutIntentId = pick(data, ["x-fs_checkout_intent_id", "fs_checkout_intent_id"]);
+  const cometlyClickId = pick(data, ["x-cometly_click_id", "cometly_click_id", "cometly_id"]);
+  const fbclid = pick(data, ["x-fbclid", "fbclid"]);
+  const fbc = pick(data, ["x-fbc", "fbc"]);
+  const fbp = pick(data, ["x-fbp", "fbp"]);
 
   const trackingId =
-    pick(raw, ["x-cometly_click_id", "cometly_click_id", "x-fs_session_id", "fs_session_id"]) ||
+    cometlyClickId ||
+    sessionId ||
+    checkoutIntentId ||
+    fbc ||
+    fbp ||
+    fbclid ||
     email ||
     orderId;
 
+  const sanitizedQueryString = sanitizeQueryString(data.CHECKOUT_QUERY_STRING);
+
   return {
-    event_name: upsell ? "custom_event_1" : "purchase",
+    event_name: upsell ? UPSELL_EVENT_NAME : MAIN_EVENT_NAME,
     email,
-    ip: pick(raw, ["CUSTOMER_IP"]) || req.headers["x-forwarded-for"]?.split(",")[0]?.trim() || "",
+    ip: pick(data, ["CUSTOMER_IP"]) || req.headers["x-forwarded-for"]?.split(",")[0]?.trim() || "",
     user_agent: req.headers["user-agent"] || "",
-    event_time: eventTime,
-    url: pick(raw, ["x-checkout_page_url", "checkout_page_url", "ORDER_REFERRER_URL"]) || "",
-    amount,
+    event_time: getEventTime(data),
+    url: pick(data, ["x-checkout_page_url", "checkout_page_url", "ORDER_REFERRER_URL"]) || "",
+    amount: getAmount(data),
+    currency: getCurrency(data),
+
     order_id: itemId ? `${orderId}-${itemId}` : orderId,
-    order_name: pick(raw, ["ORDER_ITEM_NAME"]) || "PayPro Order",
+    order_name: pick(data, ["ORDER_ITEM_NAME"]) || "PayPro Order",
     tracking_id: trackingId,
-    checkout_token: pick(raw, ["x-fs_checkout_intent_id", "fs_checkout_intent_id"]),
+    checkout_token: checkoutIntentId,
     is_upsell: upsell,
-    upsell_common_id: pick(raw, ["x-root_order_id", "root_order_id", "x-fs_session_id", "fs_session_id"]) || orderId,
+    upsell_common_id: pick(data, ["x-root_order_id", "root_order_id", "x-parent_order_id", "parent_order_id"]) || sessionId || orderId,
     idempotency_key: itemId ? `paypro-${orderId}-${itemId}` : `paypro-${orderId}-${productId}`,
 
-    first_name: pick(raw, ["CUSTOMER_FIRST_NAME"]),
-    last_name: pick(raw, ["CUSTOMER_LAST_NAME"]),
-    full_name: pick(raw, ["CUSTOMER_NAME"]),
-    phone: pick(raw, ["CUSTOMER_PHONE"]),
+    first_name: pick(data, ["CUSTOMER_FIRST_NAME"]),
+    last_name: pick(data, ["CUSTOMER_LAST_NAME"]),
+    full_name: pick(data, ["CUSTOMER_NAME"]),
+    phone: pick(data, ["CUSTOMER_PHONE"]),
 
-    comet_source: pick(raw, ["x-utm_source", "utm_source"]),
-    comet_network: pick(raw, ["x-utm_source", "utm_source"]),
-    comet_campaign: pick(raw, ["x-utm_campaign", "utm_campaign"]),
-    comet_ad_group: pick(raw, ["x-utm_content", "utm_content"]),
-    comet_ad_id: pick(raw, ["x-fbclid", "fbclid"]),
-    comet_keyword: pick(raw, ["x-utm_term", "utm_term"]),
-    comet_type: pick(raw, ["x-utm_medium", "utm_medium"]),
+    comet_source: pick(data, ["x-utm_source", "utm_source"]),
+    comet_network: pick(data, ["x-utm_source", "utm_source"]),
+    comet_campaign: pick(data, ["x-utm_campaign", "utm_campaign"]),
+    comet_ad_group: pick(data, ["x-utm_content", "utm_content"]),
+    comet_ad_id: fbclid,
+    comet_keyword: pick(data, ["x-utm_term", "utm_term"]),
+    comet_type: pick(data, ["x-utm_medium", "utm_medium"]),
 
     profile_field_1: "paypro",
-    profile_field_2: pick(raw, ["x-funnel_id", "funnel_id"]),
-    profile_field_3: pick(raw, ["x-offer_step", "offer_step"]) || (upsell ? "upsell" : "checkout_main"),
+    profile_field_2: pick(data, ["x-funnel_id", "funnel_id"]),
+    profile_field_3: pick(data, ["x-offer_step", "offer_step"]) || (upsell ? "upsell" : "checkout_main"),
     profile_field_4: productId,
-    profile_field_5: pick(raw, ["ORDER_ITEM_SKU"]),
-    profile_field_6: pick(raw, ["ORDER_ITEM_NAME"]),
-    profile_field_7: pick(raw, ["PAYMENT_METHOD_NAME"]),
-    profile_field_8: pick(raw, ["CUSTOMER_COUNTRY_CODE", "CUSTOMER_COUNTRY_CODE_BY_IP"]),
-    profile_field_9: pick(raw, ["x-selected_order_bumps", "selected_order_bumps"]),
-    profile_field_10: pick(raw, ["x-fbclid", "fbclid"]),
-    profile_field_11: pick(raw, ["x-fbc", "fbc"]),
-    profile_field_12: pick(raw, ["x-fbp", "fbp"]),
-    profile_field_13: pick(raw, ["x-gclid", "gclid"]),
-    profile_field_14: pick(raw, ["x-ttclid", "ttclid"]),
-    profile_field_15: pick(raw, ["CHECKOUT_QUERY_STRING"])
+    profile_field_5: pick(data, ["ORDER_ITEM_SKU"]),
+    profile_field_6: pick(data, ["ORDER_ITEM_NAME"]),
+    profile_field_7: pick(data, ["PAYMENT_METHOD_NAME"]),
+    profile_field_8: pick(data, ["CUSTOMER_COUNTRY_CODE", "CUSTOMER_COUNTRY_CODE_BY_IP"]),
+    profile_field_9: pick(data, ["x-selected_order_bumps", "selected_order_bumps"]),
+    profile_field_10: fbclid,
+    profile_field_11: fbc,
+    profile_field_12: fbp,
+    profile_field_13: pick(data, ["x-gclid", "gclid"]),
+    profile_field_14: pick(data, ["x-ttclid", "ttclid"]),
+    profile_field_15: sanitizedQueryString
+  };
+}
+
+function buildSafeLog(raw) {
+  const data = mergePayProData(raw);
+
+  return {
+    ORDER_ID: data.ORDER_ID,
+    PRODUCT_ID: data.PRODUCT_ID,
+    ORDER_ITEM_ID: data.ORDER_ITEM_ID,
+    ORDER_ITEM_NAME: data.ORDER_ITEM_NAME,
+    ORDER_ITEM_SKU: data.ORDER_ITEM_SKU,
+    ORDER_STATUS: data.ORDER_STATUS,
+    IPN_TYPE_NAME: data.IPN_TYPE_NAME,
+    TEST_MODE: data.TEST_MODE,
+    CUSTOMER_EMAIL: maskEmail(data.CUSTOMER_EMAIL),
+    PAYMENT_METHOD_NAME: data.PAYMENT_METHOD_NAME,
+    ORDER_CURRENCY_CODE: data.ORDER_CURRENCY_CODE,
+    VENDOR_BALANCE_CURRENCY_CODE: data.VENDOR_BALANCE_CURRENCY_CODE,
+    ORDER_ITEM_TOTAL_AMOUNT: data.ORDER_ITEM_TOTAL_AMOUNT,
+    ORDER_TOTAL_AMOUNT_SHOWN: data.ORDER_TOTAL_AMOUNT_SHOWN,
+    CHECKOUT_QUERY_STRING: sanitizeQueryString(data.CHECKOUT_QUERY_STRING)
   };
 }
 
@@ -105,16 +244,18 @@ export default async function handler(req, res) {
 
   try {
     const raw = req.body || {};
-    console.log("PAYPRO RAW:", raw);
+    console.log("PAYPRO SAFE RAW:", buildSafeLog(raw));
 
     const apiKey = process.env.COMETLY_API_KEY;
+
     if (!apiKey) {
       console.error("Missing COMETLY_API_KEY");
       return res.status(500).json({ ok: false, error: "Missing COMETLY_API_KEY" });
     }
 
-    const status = pick(raw, ["ORDER_STATUS"]);
-    const ipnType = pick(raw, ["IPN_TYPE_NAME"]);
+    const data = mergePayProData(raw);
+    const status = pick(data, ["ORDER_STATUS"]);
+    const ipnType = pick(data, ["IPN_TYPE_NAME"]);
 
     if (status && status !== "Processed") {
       return res.status(200).json({ ok: true, skipped: "Non processed order" });
@@ -125,6 +266,22 @@ export default async function handler(req, res) {
     }
 
     const event = buildEvent(raw, req);
+
+    console.log("COMETLY PAYLOAD SAFE:", {
+      event_name: event.event_name,
+      email: maskEmail(event.email),
+      amount: event.amount,
+      currency: event.currency,
+      order_id: event.order_id,
+      is_upsell: event.is_upsell,
+      tracking_id: event.tracking_id ? "[present]" : "",
+      checkout_token: event.checkout_token ? "[present]" : "",
+      profile_field_2: event.profile_field_2,
+      profile_field_3: event.profile_field_3,
+      profile_field_10: event.profile_field_10 ? "[fbclid present]" : "",
+      profile_field_11: event.profile_field_11 ? "[fbc present]" : "",
+      profile_field_12: event.profile_field_12 ? "[fbp present]" : ""
+    });
 
     const response = await fetch(COMETLY_API_URL, {
       method: "POST",
@@ -148,9 +305,17 @@ export default async function handler(req, res) {
       });
     }
 
-    return res.status(200).json({ ok: true, sent_to_cometly: true });
+    return res.status(200).json({
+      ok: true,
+      sent_to_cometly: true,
+      event_name: event.event_name,
+      order_id: event.order_id
+    });
   } catch (err) {
     console.error("WEBHOOK ERROR:", err);
-    return res.status(500).json({ ok: false, error: String(err && err.message ? err.message : err) });
+    return res.status(500).json({
+      ok: false,
+      error: String(err && err.message ? err.message : err)
+    });
   }
 }
