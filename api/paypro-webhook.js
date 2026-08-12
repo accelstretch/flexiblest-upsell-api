@@ -335,6 +335,21 @@ export default async function handler(req, res) {
 
     const mappingSaved = await persistMainCheckout(data);
 
+    if (pick(data, ["TEST_MODE"]) === "1") {
+      console.log("PAYPRO TEST-MODE IPN VERIFIED", {
+        order_id: orderId,
+        product_id: productId,
+        mapping_saved: mappingSaved
+      });
+
+      return res.status(200).json({
+        ok: true,
+        test_mode: true,
+        mapping_saved: mappingSaved,
+        sent_to_cometly: false
+      });
+    }
+
     if (shouldSkipCheckoutBumpIpn(data)) {
       console.log("PAYPRO CHECKOUT BUMP IPN SKIPPED:", {
         ORDER_ID: orderId, PRODUCT_ID: productId, ORDER_ITEM_ID: itemId,
