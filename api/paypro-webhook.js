@@ -1,3 +1,5 @@
+import { createHash, timingSafeEqual } from "node:crypto";
+
 const COMETLY_API_URL = "https://app.cometly.com/public-api/v1/events/track";
 const MAIN_EVENT_NAME = "purchase";
 const UPSELL_EVENT_NAME = process.env.COMETLY_UPSELL_EVENT_NAME || "custom_event_1";
@@ -65,6 +67,41 @@ function mergePayProData(input) {
     _query: queryData,
     _customFields: customFieldData
   };
+}
+
+function verifyPayProSignature(data) {
+  const validationKey = process.env.PAYPRO_VALIDATION_KEY;
+
+  if (!validationKey) {
+    throw new Error("Missing PAYPRO_VALIDATION_KEY");
+  }
+
+  const received = pick(data, ["SIGNATURE"]).toLowerCase();
+
+  if (!/^[a-f0-9]{64}$/.test(received)) {
+    return false;
+  }
+
+  const signedValue =
+    safeString(data.ORDER_ID) +
+    safeString(data.ORDER_STATUS) +
+    safeString(data.ORDER_TOTAL_AMOUNT) +
+    safeString(data.CUSTOMER_EMAIL) +
+    validationKey +
+    safeString(data.TEST_MODE) +
+    safeString(data.IPN_TYPE_NAME);
+
+  const expected = createHash("sha256")
+    .update(signedValue, "utf8")
+    .digest("hex");
+
+  const receivedBuffer = Buffer.from(received, "hex");
+  const expectedBuffer = Buffer.from(expected, "hex");
+
+  return (
+    receivedBuffer.length === expectedBuffer.length &&
+    timingSafeEqual(receivedBuffer, expectedBuffer)
+  );
 }
 
 function sanitizeQueryString(value) {
@@ -273,6 +310,20 @@ export default async function handler(req, res) {
     const raw = normalizeBody(req.body);
     console.log("PAYPRO SAFE RAW:", buildSafeLog(raw));
     const data = mergePayProData(raw);
+
+    if (!verifyPayProSignature(data)) {
+      console.error("PAYPRO WEBHOOK SIGNATURE REJECTED", {
+        has_signature: Boolean(pick(data, ["SIGNATURE"])),
+        order_id: pick(data, ["ORDER_ID"]),
+        ipn_type: pick(data, ["IPN_TYPE_NAME"])
+      });
+
+      return res.status(401).json({
+        ok: false,
+        error: "Invalid PayPro signature"
+      });
+    }
+
     const status = pick(data, ["ORDER_STATUS"]);
     const ipnType = pick(data, ["IPN_TYPE_NAME"]);
     const productId = pick(data, ["PRODUCT_ID"]);
