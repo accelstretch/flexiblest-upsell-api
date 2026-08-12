@@ -61,8 +61,8 @@ function mergePayProData(input) {
   const customFieldData = parseParamString(raw.ORDER_CUSTOM_FIELDS);
 
   return {
-    ...queryData,
     ...customFieldData,
+    ...queryData,
     ...raw,
     _query: queryData,
     _customFields: customFieldData
