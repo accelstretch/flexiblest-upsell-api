@@ -1,4 +1,7 @@
-import { createHash, timingSafeEqual } from "node:crypto";
+import {
+  createHash,
+  timingSafeEqual
+} from "node:crypto";
 
 const COMETLY_API_URL =
   "https://app.cometly.com/public-api/v1/events/track";
@@ -6,28 +9,102 @@ const COMETLY_API_URL =
 const MAIN_EVENT_NAME = "purchase";
 
 const UPSELL_EVENT_NAME =
-  process.env.COMETLY_UPSELL_EVENT_NAME || "custom_event_1";
+  process.env.COMETLY_UPSELL_EVENT_NAME ||
+  "custom_event_1";
 
 const MAIN_CHECKOUT_PRODUCT_ID = "133559";
-const CHECKOUT_TTL_SECONDS = 72 * 60 * 60;
 
-const SECRET_QUERY_KEYS = [
-  "secret-key",
-  "secret_key",
-  "key",
-  "hash",
-  "signature"
-];
+const UPSELL_PRODUCT_IDS = new Set([
+  "133573",
+  "133574",
+  "133575"
+]);
 
-const PII_QUERY_KEYS_TO_MASK = [
-  "billing-email",
-  "x-grant_email",
-  "x-kajabi_email",
-  "email"
-];
+const SESSION_TTL_SECONDS = 72 * 60 * 60;
+const COMETLY_EVENT_TTL_SECONDS = 30 * 24 * 60 * 60;
+const COMETLY_LOCK_SECONDS = 120;
 
-function safeString(value) {
-  return String(value ?? "").trim();
+const RELEASE_LOCK_SCRIPT = `
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+  return redis.call("DEL", KEYS[1])
+end
+
+return 0
+`;
+
+const UPDATE_MAIN_SESSION_SCRIPT = `
+local raw = redis.call("GET", KEYS[1])
+
+if not raw then
+  return "MISSING"
+end
+
+local ok, session = pcall(cjson.decode, raw)
+
+if not ok or type(session) ~= "table" then
+  return "INVALID"
+end
+
+if tostring(session["fs_session_id"] or "") ~= ARGV[1] then
+  return "SESSION_MISMATCH"
+end
+
+if tostring(session["fs_checkout_intent_id"] or "") ~= ARGV[2] then
+  return "INTENT_MISMATCH"
+end
+
+local tokenHash = tostring(session["access_token_hash"] or "")
+
+if string.len(tokenHash) ~= 64 or
+   string.match(tokenHash, "^[a-fA-F0-9]+$") == nil then
+  return "INSECURE_SESSION"
+end
+
+local existingOrderId =
+  tostring(session["paypro_root_order_id"] or "")
+
+if existingOrderId ~= "" and existingOrderId ~= ARGV[3] then
+  return "ORDER_MISMATCH"
+end
+
+session["status"] = "paid"
+session["checkout_started"] = true
+session["checkout_completed"] = true
+session["paypro_root_order_id"] = ARGV[3]
+session["product_id"] = ARGV[4]
+session["customer_email"] = ARGV[5]
+session["customer_first_name"] = ARGV[6]
+session["customer_last_name"] = ARGV[7]
+session["customer_phone"] = ARGV[8]
+session["currency"] = ARGV[9]
+session["amount"] = tonumber(ARGV[10]) or 0
+session["paypro_ipn_type"] = ARGV[11]
+session["paypro_order_status"] = ARGV[12]
+
+if tostring(session["paid_at"] or "") == "" then
+  session["paid_at"] = ARGV[13]
+end
+
+session["updated_at"] = ARGV[14]
+session["expires_at"] = ARGV[15]
+
+redis.call(
+  "SET",
+  KEYS[1],
+  cjson.encode(session),
+  "EX",
+  ARGV[16]
+)
+
+return cjson.encode(session)
+`;
+
+function clean(value, maxLength = 2000) {
+  return String(value ?? "")
+    .replace(/[\u0000-\u001f\u007f]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, maxLength);
 }
 
 function safeEqual(left, right) {
@@ -47,34 +124,50 @@ function safeEqual(left, right) {
   );
 }
 
+function isPlainObject(value) {
+  return (
+    value !== null &&
+    typeof value === "object" &&
+    !Array.isArray(value)
+  );
+}
+
 function funnelSessionKey(sessionId) {
   return `paypro:funnel:session:${sessionId}`;
 }
 
+function cometlySentKey(idempotencyKey) {
+  return `paypro:cometly:sent:${idempotencyKey}`;
+}
+
+function cometlyLockKey(idempotencyKey) {
+  return `paypro:cometly:lock:${idempotencyKey}`;
+}
+
 function isValidSessionIdentifier(value) {
-  const identifier = safeString(value);
+  const identifier = clean(value, 160);
 
   return (
-    identifier.length >= 16 &&
-    identifier.length <= 128 &&
+    identifier.length >= 20 &&
+    identifier.length <= 160 &&
     /^[A-Za-z0-9_-]+$/.test(identifier)
   );
 }
 
 function isValidStoredAccessTokenHash(value) {
-  return /^[a-f0-9]{64}$/i.test(safeString(value));
+  return /^[a-f0-9]{64}$/i.test(clean(value, 128));
 }
 
-function pick(obj, keys) {
+function pick(obj, keys, maxLength = 2000) {
   for (const key of keys) {
     const value = obj?.[key];
 
     if (
       value !== undefined &&
       value !== null &&
-      safeString(value) !== ""
+      clean(value, maxLength) !== ""
     ) {
-      return safeString(value);
+      return clean(value, maxLength);
     }
   }
 
@@ -82,33 +175,53 @@ function pick(obj, keys) {
 }
 
 function num(value) {
-  const parsed = parseFloat(
-    safeString(value).replace(",", ".")
-  );
+  const normalized = clean(value, 100)
+    .replace(/\s/g, "")
+    .replace(",", ".");
 
-  return Number.isFinite(parsed) ? parsed : 0;
+  const parsed = Number.parseFloat(normalized);
+
+  return Number.isFinite(parsed) && parsed >= 0
+    ? parsed
+    : 0;
 }
 
-function maskEmail(email) {
-  const clean = safeString(email);
+function normalizeEmail(value) {
+  return clean(value, 254).toLowerCase();
+}
 
-  if (!clean || !clean.includes("@")) {
-    return clean;
+function validEmail(value) {
+  const email = normalizeEmail(value);
+
+  return (
+    email.length >= 3 &&
+    email.length <= 254 &&
+    /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)
+  );
+}
+
+function maskEmail(value) {
+  const email = normalizeEmail(value);
+
+  if (!validEmail(email)) {
+    return email ? "[invalid-email]" : "";
   }
 
-  const [name, domain] = clean.split("@");
+  const atIndex = email.indexOf("@");
+  const local = email.slice(0, atIndex);
+  const domain = email.slice(atIndex + 1);
 
-  return `${name.slice(0, 2)}***@${domain}`;
+  return `${local.slice(0, 2)}***@${domain}`;
 }
 
 function parseParamString(value) {
   const output = {};
-
-  const input = safeString(value)
+  const input = String(value ?? "")
+    .trim()
     .replace(/^\?/, "")
     .replace(/&amp;/gi, "&");
 
-  if (!input) {
+  if (!input || input.length > 50000) {
     return output;
   }
 
@@ -116,10 +229,17 @@ function parseParamString(value) {
     const params = new URLSearchParams(input);
 
     params.forEach((paramValue, key) => {
-      output[key] = paramValue;
+      const normalizedKey = clean(key, 200);
 
-      if (key.startsWith("x-")) {
-        output[key.slice(2)] = paramValue;
+      if (!normalizedKey) {
+        return;
+      }
+
+      output[normalizedKey] = clean(paramValue, 4000);
+
+      if (normalizedKey.startsWith("x-")) {
+        output[normalizedKey.slice(2)] =
+          clean(paramValue, 4000);
       }
     });
   } catch {}
@@ -132,15 +252,40 @@ function normalizeBody(body) {
     return {};
   }
 
-  if (typeof body === "object") {
+  if (isPlainObject(body)) {
     return body;
   }
 
-  return parseParamString(body);
+  if (Buffer.isBuffer(body)) {
+    return parseParamString(body.toString("utf8"));
+  }
+
+  if (typeof body === "string") {
+    const trimmed = body.trim();
+
+    if (!trimmed) {
+      return {};
+    }
+
+    if (trimmed.startsWith("{")) {
+      try {
+        const parsed = JSON.parse(trimmed);
+
+        return isPlainObject(parsed)
+          ? parsed
+          : {};
+      } catch {}
+    }
+
+    return parseParamString(trimmed);
+  }
+
+  return {};
 }
 
 function mergePayProData(input) {
   const raw = normalizeBody(input);
+
   const queryData = parseParamString(
     raw.CHECKOUT_QUERY_STRING
   );
@@ -152,95 +297,52 @@ function mergePayProData(input) {
   return {
     ...customFieldData,
     ...queryData,
-    ...raw,
-    _query: queryData,
-    _customFields: customFieldData
+    ...raw
   };
 }
 
 function verifyPayProSignature(data) {
-  const validationKey =
-    process.env.PAYPRO_VALIDATION_KEY;
+  const validationKey = clean(
+    process.env.PAYPRO_VALIDATION_KEY,
+    4000
+  );
 
   if (!validationKey) {
     throw new Error("Missing PAYPRO_VALIDATION_KEY");
   }
 
-  const received = pick(data, ["SIGNATURE"])
-    .toLowerCase();
+  const received = pick(
+    data,
+    ["SIGNATURE"],
+    128
+  ).toLowerCase();
 
   if (!/^[a-f0-9]{64}$/.test(received)) {
     return false;
   }
 
   const signedValue =
-    safeString(data.ORDER_ID) +
-    safeString(data.ORDER_STATUS) +
-    safeString(data.ORDER_TOTAL_AMOUNT) +
-    safeString(data.CUSTOMER_EMAIL) +
+    clean(data.ORDER_ID, 200) +
+    clean(data.ORDER_STATUS, 200) +
+    clean(data.ORDER_TOTAL_AMOUNT, 200) +
+    clean(data.CUSTOMER_EMAIL, 254) +
     validationKey +
-    safeString(data.TEST_MODE) +
-    safeString(data.IPN_TYPE_NAME);
+    clean(data.TEST_MODE, 50) +
+    clean(data.IPN_TYPE_NAME, 200);
 
   const expected = createHash("sha256")
     .update(signedValue, "utf8")
     .digest("hex");
 
-  const receivedBuffer = Buffer.from(
-    received,
-    "hex"
-  );
-
-  const expectedBuffer = Buffer.from(
-    expected,
-    "hex"
-  );
-
-  return (
-    receivedBuffer.length === expectedBuffer.length &&
-    timingSafeEqual(receivedBuffer, expectedBuffer)
-  );
-}
-
-function sanitizeQueryString(value) {
-  const input = safeString(value)
-    .replace(/^\?/, "")
-    .replace(/&amp;/gi, "&");
-
-  if (!input) {
-    return "";
-  }
-
-  try {
-    const params = new URLSearchParams(input);
-
-    SECRET_QUERY_KEYS.forEach((key) => {
-      if (params.has(key)) {
-        params.set(key, "[removed]");
-      }
-    });
-
-    PII_QUERY_KEYS_TO_MASK.forEach((key) => {
-      if (params.has(key)) {
-        params.set(
-          key,
-          maskEmail(params.get(key))
-        );
-      }
-    });
-
-    return params.toString();
-  } catch {
-    return "[unparseable_query_string]";
-  }
+  return safeEqual(received, expected);
 }
 
 function getOfferStep(data) {
-  return pick(data, [
-    "x-offer_step",
-    "offer_step",
-    "OFFER_STEP"
-  ]).toLowerCase();
+  return pick(
+    data,
+    ["x-offer_step", "offer_step", "OFFER_STEP"],
+    200
+  ).toLowerCase();
 }
 
 function isCheckoutMain(data) {
@@ -249,135 +351,142 @@ function isCheckoutMain(data) {
   return !step || step === "checkout_main";
 }
 
-function shouldSkipCheckoutBumpIpn(data) {
-  const productId = pick(data, ["PRODUCT_ID"]);
+function isMainProductIpn(data) {
+  return (
+    isCheckoutMain(data) &&
+    pick(data, ["PRODUCT_ID"], 100) ===
+      MAIN_CHECKOUT_PRODUCT_ID
+  );
+}
+
+function isCheckoutBumpIpn(data) {
+  const productId = pick(data, ["PRODUCT_ID"], 100);
 
   return (
     isCheckoutMain(data) &&
-    productId &&
+    Boolean(productId) &&
     productId !== MAIN_CHECKOUT_PRODUCT_ID
   );
 }
 
-function isUpsell(data) {
+function isUpsellIpn(data) {
+  const productId = pick(data, ["PRODUCT_ID"], 100);
+
+  if (UPSELL_PRODUCT_IDS.has(productId)) {
+    return true;
+  }
+
   const step = getOfferStep(data);
 
-  const sku = pick(data, [
-    "ORDER_ITEM_SKU"
-  ]).toLowerCase();
-
-  const productId = pick(data, ["PRODUCT_ID"]);
-
-  const upsellStepParts = [
+  return [
     "upsell",
     "downsell",
+    "fasttrack",
     "fast_track",
-    "complete_fast_track",
-    "fast-track",
-    "bodyplan"
-  ];
-
-  if (
-    upsellStepParts.some((part) =>
-      step.includes(part)
-    )
-  ) {
-    return true;
-  }
-
-  const upsellSkuParts = [
-    "upsl",
-    "upsell",
-    "downsell"
-  ];
-
-  if (
-    upsellSkuParts.some((part) =>
-      sku.includes(part)
-    )
-  ) {
-    return true;
-  }
-
-  return [
-    "133573",
-    "133574",
-    "133575"
-  ].includes(productId);
+    "fast-track"
+  ].some((part) => step.includes(part));
 }
 
-function getCheckoutMainAmount(data) {
+function getMainAmount(data) {
   return (
-    num(pick(data, ["x-total", "total"])) ||
+    num(data.ORDER_TOTAL_AMOUNT) ||
     num(data.ORDER_TOTAL_AMOUNT_SHOWN) ||
-    num(
-      data.ORDER_TOTAL_AMOUNT_WITH_TAXES_SHOWN
-    ) ||
-    num(
-      data.ORDER_TOTAL_BALANCE_CURRENCY_AMOUNT
-    ) ||
-    num(
-      data.ORDER_ITEM_BALANCE_CURRENCY_TOTAL_AMOUNT
-    ) ||
+    num(data.ORDER_TOTAL_AMOUNT_WITH_TAXES_SHOWN) ||
+    num(data.ORDER_TOTAL_BALANCE_CURRENCY_AMOUNT) ||
     num(data.ORDER_ITEM_TOTAL_AMOUNT)
   );
 }
 
-function getItemAmount(data) {
+function getUpsellAmount(data) {
   return (
-    num(
-      data.ORDER_ITEM_BALANCE_CURRENCY_TOTAL_AMOUNT
-    ) ||
+    num(data.ORDER_TOTAL_AMOUNT) ||
     num(data.ORDER_ITEM_TOTAL_AMOUNT) ||
-    num(
-      data.ORDER_TOTAL_BALANCE_CURRENCY_AMOUNT
-    ) ||
+    num(data.ORDER_ITEM_BALANCE_CURRENCY_TOTAL_AMOUNT) ||
     num(data.ORDER_TOTAL_AMOUNT_SHOWN) ||
-    num(
-      data.ORDER_TOTAL_AMOUNT_WITH_TAXES_SHOWN
-    )
+    num(data.ORDER_TOTAL_BALANCE_CURRENCY_AMOUNT)
   );
-}
-
-function getAmount(data) {
-  return isCheckoutMain(data)
-    ? getCheckoutMainAmount(data)
-    : getItemAmount(data);
 }
 
 function getCurrency(data) {
   return (
-    pick(data, [
-      "VENDOR_BALANCE_CURRENCY_CODE"
-    ]) ||
-    pick(data, ["ORDER_CURRENCY_CODE"]) ||
+    pick(data, ["ORDER_CURRENCY_CODE"], 20) ||
+    pick(data, ["VENDOR_BALANCE_CURRENCY_CODE"], 20) ||
     "USD"
-  );
+  ).toUpperCase();
 }
 
 function getEventTime(data) {
-  const raw = pick(data, [
-    "ORDER_PLACED_TIME_UTC"
-  ]);
+  const raw = pick(
+    data,
+    ["ORDER_PLACED_TIME_UTC"],
+    200
+  );
 
   if (!raw) {
     return new Date().toISOString();
   }
 
-  const parsed = new Date(`${raw} UTC`);
+  const direct = new Date(raw);
 
-  return Number.isNaN(parsed.getTime())
+  if (!Number.isNaN(direct.getTime())) {
+    return direct.toISOString();
+  }
+
+  const assumedUtc = new Date(`${raw} UTC`);
+
+  return Number.isNaN(assumedUtc.getTime())
     ? new Date().toISOString()
-    : parsed.toISOString();
+    : assumedUtc.toISOString();
+}
+
+function cleanPageUrl(value) {
+  const input = clean(value, 4000);
+
+  if (!input) {
+    return "";
+  }
+
+  try {
+    const url = new URL(input);
+
+    if (
+      url.protocol !== "https:" &&
+      url.protocol !== "http:"
+    ) {
+      return "";
+    }
+
+    return `${url.origin}${url.pathname}`;
+  } catch {
+    return "";
+  }
+}
+
+function getRequestIp(req) {
+  const forwarded =
+    req.headers["x-vercel-forwarded-for"] ||
+    req.headers["x-forwarded-for"] ||
+    req.headers["x-real-ip"] ||
+    "";
+
+  return clean(String(forwarded).split(",")[0], 100);
+}
+
+function isTestMode(data) {
+  return ["1", "true", "yes"].includes(
+    pick(data, ["TEST_MODE"], 20).toLowerCase()
+  );
 }
 
 async function redisCommand(command) {
-  const url = safeString(
-    process.env.KV_REST_API_URL
+  const url = clean(
+    process.env.KV_REST_API_URL,
+    2000
   ).replace(/\/+$/, "");
 
-  const token = safeString(
-    process.env.KV_REST_API_TOKEN
+  const token = clean(
+    process.env.KV_REST_API_TOKEN,
+    4000
   );
 
   if (!url || !token) {
@@ -387,8 +496,7 @@ async function redisCommand(command) {
   }
 
   const controller = new AbortController();
-
-  const timeout = setTimeout(
+  const timeoutId = setTimeout(
     () => controller.abort(),
     8000
   );
@@ -404,309 +512,483 @@ async function redisCommand(command) {
       signal: controller.signal
     });
 
-    const responseData = await response
+    const payload = await response
       .json()
-      .catch(() => ({}));
+      .catch(() => null);
 
-    if (!response.ok || responseData.error) {
+    if (
+      !response.ok ||
+      !payload ||
+      Object.prototype.hasOwnProperty.call(
+        payload,
+        "error"
+      )
+    ) {
       throw new Error(
         `Redis command failed: ${
-          responseData.error || response.status
+          payload?.error || response.status
         }`
       );
     }
 
-    return responseData.result;
+    return payload.result;
   } finally {
-    clearTimeout(timeout);
+    clearTimeout(timeoutId);
+  }
+}
+
+function parseStoredRecord(value) {
+  if (value === null || value === undefined || value === "") {
+    return null;
+  }
+
+  if (isPlainObject(value)) {
+    return value;
+  }
+
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(value);
+
+    return isPlainObject(parsed) ? parsed : null;
+  } catch {
+    return null;
   }
 }
 
 async function readJsonFromRedis(key) {
-  const stored = await redisCommand([
-    "GET",
-    key
-  ]);
+  const stored = await redisCommand(["GET", key]);
 
   if (stored === null || stored === undefined) {
     return null;
   }
 
-  if (
-    typeof stored === "object" &&
-    !Array.isArray(stored)
-  ) {
-    return stored;
-  }
+  const parsed = parseStoredRecord(stored);
 
-  if (typeof stored !== "string") {
-    throw new Error(
-      "Stored funnel session has an invalid format"
-    );
-  }
-
-  try {
-    const parsed = JSON.parse(stored);
-
-    if (
-      !parsed ||
-      typeof parsed !== "object" ||
-      Array.isArray(parsed)
-    ) {
-      throw new Error(
-        "Stored funnel session is not an object"
-      );
-    }
-
-    return parsed;
-  } catch {
+  if (!parsed) {
     throw new Error(
       "Stored funnel session contains invalid JSON"
     );
   }
+
+  return parsed;
 }
 
-async function writeJsonToRedis(
-  key,
-  value,
-  ttlSeconds
+function sessionIdentityMatches(
+  session,
+  sessionId,
+  checkoutIntentId
 ) {
-  const result = await redisCommand([
-    "SET",
-    key,
-    JSON.stringify(value),
-    "EX",
-    ttlSeconds
-  ]);
+  return Boolean(
+    session &&
+    safeEqual(session.fs_session_id, sessionId) &&
+    safeEqual(
+      session.fs_checkout_intent_id,
+      checkoutIntentId
+    ) &&
+    isValidStoredAccessTokenHash(
+      session.access_token_hash
+    )
+  );
+}
 
-  if (result !== "OK") {
-    throw new Error(
-      "Redis did not save the funnel session"
-    );
-  }
+function getSessionIdentifiers(data) {
+  return {
+    sessionId: pick(
+      data,
+      ["x-fs_session_id", "fs_session_id"],
+      160
+    ),
+    checkoutIntentId: pick(
+      data,
+      [
+        "x-fs_checkout_intent_id",
+        "fs_checkout_intent_id"
+      ],
+      160
+    )
+  };
+}
+
+function getCustomer(data) {
+  return {
+    email: normalizeEmail(
+      pick(
+        data,
+        [
+          "CUSTOMER_EMAIL",
+          "billing-email",
+          "x-grant_email",
+          "grant_email",
+          "x-kajabi_email",
+          "kajabi_email"
+        ],
+        254
+      )
+    ),
+    firstName: pick(
+      data,
+      ["CUSTOMER_FIRST_NAME"],
+      100
+    ),
+    lastName: pick(
+      data,
+      ["CUSTOMER_LAST_NAME"],
+      100
+    ),
+    fullName: pick(
+      data,
+      ["CUSTOMER_NAME"],
+      220
+    ),
+    phone: pick(
+      data,
+      ["CUSTOMER_PHONE"],
+      100
+    )
+  };
 }
 
 async function persistMainCheckout(data) {
-  const productId = pick(data, ["PRODUCT_ID"]);
+  const { sessionId, checkoutIntentId } =
+    getSessionIdentifiers(data);
 
-  if (
-    !isCheckoutMain(data) ||
-    productId !== MAIN_CHECKOUT_PRODUCT_ID
-  ) {
-    return false;
-  }
-
-  const sessionId = pick(data, [
-    "x-fs_session_id",
-    "fs_session_id"
-  ]);
-
-  const checkoutIntentId = pick(data, [
-    "x-fs_checkout_intent_id",
-    "fs_checkout_intent_id"
-  ]);
-
-  const orderId = pick(data, ["ORDER_ID"]);
+  const orderId = pick(data, ["ORDER_ID"], 200);
+  const productId = pick(data, ["PRODUCT_ID"], 100);
 
   if (
     !isValidSessionIdentifier(sessionId) ||
     !isValidSessionIdentifier(checkoutIntentId) ||
-    !orderId
+    !/^\d+$/.test(orderId)
   ) {
-    console.warn(
-      "PAYPRO CHECKOUT SESSION REJECTED",
-      {
-        order_id: orderId,
-        has_session_id: Boolean(sessionId),
-        has_checkout_intent_id:
-          Boolean(checkoutIntentId),
-        has_order_id: Boolean(orderId),
-        reason: "missing_or_invalid_identifiers"
-      }
-    );
-
-    return false;
+    return {
+      authorized: false,
+      reason: "missing_or_invalid_identifiers"
+    };
   }
 
+  const customer = getCustomer(data);
+
+  if (!validEmail(customer.email)) {
+    return {
+      authorized: false,
+      reason: "missing_or_invalid_customer_email"
+    };
+  }
+
+  const now = new Date();
+  const updatedAt = now.toISOString();
+
+  const expiresAt = new Date(
+    now.getTime() + SESSION_TTL_SECONDS * 1000
+  ).toISOString();
+
+  const paidAt = getEventTime(data);
   const key = funnelSessionKey(sessionId);
-  const session = await readJsonFromRedis(key);
 
-  const sessionIdMatches = Boolean(
-    session &&
-      safeEqual(
-        session.fs_session_id,
-        sessionId
-      )
-  );
+  const result = await redisCommand([
+    "EVAL",
+    UPDATE_MAIN_SESSION_SCRIPT,
+    "1",
+    key,
+    sessionId,
+    checkoutIntentId,
+    orderId,
+    productId,
+    customer.email,
+    customer.firstName,
+    customer.lastName,
+    customer.phone,
+    getCurrency(data),
+    String(getMainAmount(data)),
+    pick(data, ["IPN_TYPE_NAME"], 200),
+    pick(data, ["ORDER_STATUS"], 200),
+    paidAt,
+    updatedAt,
+    expiresAt,
+    String(SESSION_TTL_SECONDS)
+  ]);
 
-  const checkoutIntentMatches = Boolean(
-    session &&
-      safeEqual(
-        session.fs_checkout_intent_id,
-        checkoutIntentId
-      )
-  );
+  const rejectionReasons = new Set([
+    "MISSING",
+    "INVALID",
+    "SESSION_MISMATCH",
+    "INTENT_MISMATCH",
+    "INSECURE_SESSION",
+    "ORDER_MISMATCH"
+  ]);
 
-  const hasSecureTokenHash = Boolean(
-    session &&
-      isValidStoredAccessTokenHash(
-        session.access_token_hash
-      )
-  );
+  if (rejectionReasons.has(result)) {
+    return {
+      authorized: false,
+      reason: result.toLowerCase()
+    };
+  }
 
-  const existingOrderId = safeString(
-    session?.paypro_root_order_id
-  );
-
-  const existingOrderMatches =
-    !existingOrderId ||
-    safeEqual(existingOrderId, orderId);
+  const session = parseStoredRecord(result);
 
   if (
-    !session ||
-    !sessionIdMatches ||
-    !checkoutIntentMatches ||
-    !hasSecureTokenHash ||
-    !existingOrderMatches
+    !sessionIdentityMatches(
+      session,
+      sessionId,
+      checkoutIntentId
+    ) ||
+    !safeEqual(session.paypro_root_order_id, orderId)
   ) {
-    console.warn(
-      "PAYPRO CHECKOUT SESSION REJECTED",
-      {
-        order_id: orderId,
-        has_session: Boolean(session),
-        session_id_matches: sessionIdMatches,
-        checkout_intent_matches:
-          checkoutIntentMatches,
-        has_secure_token_hash:
-          hasSecureTokenHash,
-        existing_order_matches:
-          existingOrderMatches
-      }
+    throw new Error(
+      "Redis returned an invalid updated funnel session"
     );
-
-    return false;
   }
 
-  const customerEmail = pick(data, [
-    "CUSTOMER_EMAIL",
-    "x-grant_email",
-    "grant_email",
-    "x-kajabi_email",
-    "kajabi_email",
-    "billing-email"
-  ]);
-
-  const customerFirstName = pick(data, [
-    "CUSTOMER_FIRST_NAME"
-  ]);
-
-  const customerLastName = pick(data, [
-    "CUSTOMER_LAST_NAME"
-  ]);
-
-  const currency = getCurrency(data);
-  const amount = getCheckoutMainAmount(data);
-  const now = new Date();
-  const paidAt = session.paid_at ||
-    now.toISOString();
-
-  const updatedSession = {
-    ...session,
-    status: "paid",
-    checkout_completed: true,
-    paypro_root_order_id: orderId,
-    product_id: productId,
-    customer_email: customerEmail,
-    customer_first_name: customerFirstName,
-    customer_last_name: customerLastName,
-    currency,
-    amount,
-    paid_at: paidAt,
-    updated_at: now.toISOString(),
-    expires_at: new Date(
-      now.getTime() +
-        CHECKOUT_TTL_SECONDS * 1000
-    ).toISOString()
+  return {
+    authorized: true,
+    session,
+    sessionId,
+    checkoutIntentId,
+    orderId
   };
-
-  await writeJsonToRedis(
-    key,
-    updatedSession,
-    CHECKOUT_TTL_SECONDS
-  );
-
-  console.log(
-    "PAYPRO SECURE CHECKOUT SESSION UPDATED",
-    {
-      order_id: orderId,
-      product_id: productId,
-      has_session_id: true,
-      has_checkout_intent_id: true,
-      checkout_completed: true,
-      ttl_seconds: CHECKOUT_TTL_SECONDS
-    }
-  );
-
-  return true;
 }
 
-function buildEvent(raw, req) {
-  const data = mergePayProData(raw);
-  const orderId = pick(data, ["ORDER_ID"]);
-  const itemId = pick(data, ["ORDER_ITEM_ID"]);
-  const productId = pick(data, ["PRODUCT_ID"]);
+async function authorizeUpsell(data) {
+  const { sessionId, checkoutIntentId } =
+    getSessionIdentifiers(data);
 
-  const email = pick(data, [
-    "CUSTOMER_EMAIL",
-    "x-grant_email",
-    "grant_email",
-    "x-kajabi_email",
-    "kajabi_email",
-    "billing-email"
-  ]);
+  const rootOrderId = pick(
+    data,
+    [
+      "x-root_order_id",
+      "root_order_id",
+      "x-parent_order_id",
+      "parent_order_id"
+    ],
+    200
+  );
 
-  const upsell = isUpsell(data);
+  if (
+    !isValidSessionIdentifier(sessionId) ||
+    !isValidSessionIdentifier(checkoutIntentId) ||
+    !/^\d+$/.test(rootOrderId)
+  ) {
+    return {
+      authorized: false,
+      reason: "missing_or_invalid_upsell_identifiers"
+    };
+  }
 
-  const sessionId = pick(data, [
-    "x-fs_session_id",
-    "fs_session_id"
-  ]);
+  const session = await readJsonFromRedis(
+    funnelSessionKey(sessionId)
+  );
 
-  const checkoutIntentId = pick(data, [
-    "x-fs_checkout_intent_id",
-    "fs_checkout_intent_id"
-  ]);
+  if (
+    !sessionIdentityMatches(
+      session,
+      sessionId,
+      checkoutIntentId
+    ) ||
+    session.status !== "paid" ||
+    session.checkout_completed !== true ||
+    !safeEqual(
+      session.paypro_root_order_id,
+      rootOrderId
+    )
+  ) {
+    return {
+      authorized: false,
+      reason: "secure_root_session_mismatch"
+    };
+  }
 
-  const cometlyClickId = pick(data, [
-    "x-cometly_click_id",
-    "cometly_click_id",
-    "cometly_id"
-  ]);
+  return {
+    authorized: true,
+    session,
+    sessionId,
+    checkoutIntentId,
+    rootOrderId
+  };
+}
 
-  const fbclid = pick(data, [
-    "x-fbclid",
-    "fbclid"
-  ]);
+function getAttributionValue(session, data, keys) {
+  const attribution = isPlainObject(session?.attribution)
+    ? session.attribution
+    : {};
 
-  const fbc = pick(data, [
-    "x-fbc",
-    "fbc"
-  ]);
+  for (const key of keys) {
+    const value = clean(attribution[key], 2000);
 
-  const fbp = pick(data, [
-    "x-fbp",
-    "fbp"
-  ]);
+    if (value) {
+      return value;
+    }
+  }
 
-  const trackingId =
-    cometlyClickId ||
-    sessionId ||
-    checkoutIntentId ||
-    fbc ||
-    fbp ||
-    fbclid ||
-    email ||
-    orderId;
+  const payProKeys = [];
+
+  keys.forEach((key) => {
+    payProKeys.push(`x-${key}`, key);
+  });
+
+  return pick(data, payProKeys, 2000);
+}
+
+function getEventUrl(session, data) {
+  const requestContext = isPlainObject(
+    session?.request_context
+  )
+    ? session.request_context
+    : {};
+
+  const attribution = isPlainObject(session?.attribution)
+    ? session.attribution
+    : {};
+
+  return (
+    cleanPageUrl(requestContext.page_url) ||
+    cleanPageUrl(attribution.latest_page_url) ||
+    cleanPageUrl(attribution.landing_page_url) ||
+    cleanPageUrl(
+      pick(data, [
+        "x-checkout_page_url",
+        "checkout_page_url",
+        "ORDER_REFERRER_URL"
+      ])
+    ) ||
+    "https://flexiblest.com/secure-checkout"
+  );
+}
+
+function buildCometlyEvent(data, req, session, kind) {
+  const customer = getCustomer(data);
+
+  const email = validEmail(customer.email)
+    ? customer.email
+    : normalizeEmail(session.customer_email);
+
+  if (!validEmail(email)) {
+    throw new Error(
+      "PayPro purchase event does not contain a valid email"
+    );
+  }
+
+  const orderId = pick(data, ["ORDER_ID"], 200);
+  const productId = pick(data, ["PRODUCT_ID"], 100);
+  const upsell = kind === "upsell";
+
+  const sessionId = clean(
+    session.fs_session_id,
+    160
+  );
+
+  const checkoutIntentId = clean(
+    session.fs_checkout_intent_id,
+    160
+  );
+
+  const rootOrderId = clean(
+    session.paypro_root_order_id,
+    200
+  );
+
+  const cometToken = getAttributionValue(
+    session,
+    data,
+    ["comet_token", "cometly_token"]
+  );
+
+  const fingerprint = getAttributionValue(
+    session,
+    data,
+    ["comet_fingerprint", "cometly_fingerprint", "fingerprint"]
+  );
+
+  const cometlyClickId = getAttributionValue(
+    session,
+    data,
+    ["cometly_click_id", "cometly_id"]
+  );
+
+  const fbclid = getAttributionValue(
+    session,
+    data,
+    ["fbclid"]
+  );
+
+  const fbc = getAttributionValue(
+    session,
+    data,
+    ["fbc", "_fbc"]
+  );
+
+  const fbp = getAttributionValue(
+    session,
+    data,
+    ["fbp", "_fbp"]
+  );
+
+  const gclid = getAttributionValue(
+    session,
+    data,
+    ["gclid"]
+  );
+
+  const ttclid = getAttributionValue(
+    session,
+    data,
+    ["ttclid"]
+  );
+
+  const utmSource = getAttributionValue(
+    session,
+    data,
+    ["utm_source"]
+  );
+
+  const utmMedium = getAttributionValue(
+    session,
+    data,
+    ["utm_medium"]
+  );
+
+  const utmCampaign = getAttributionValue(
+    session,
+    data,
+    ["utm_campaign"]
+  );
+
+  const utmContent = getAttributionValue(
+    session,
+    data,
+    ["utm_content"]
+  );
+
+  const utmTerm = getAttributionValue(
+    session,
+    data,
+    ["utm_term"]
+  );
+
+  const requestContext = isPlainObject(
+    session.request_context
+  )
+    ? session.request_context
+    : {};
+
+  const amount = upsell
+    ? getUpsellAmount(data)
+    : getMainAmount(data);
+
+  const idempotencyKey = upsell
+    ? `paypro-${orderId}-${productId}`
+    : `paypro-${orderId}-purchase`;
+
+  const firstName =
+    customer.firstName ||
+    clean(session.customer_first_name, 100);
+
+  const lastName =
+    customer.lastName ||
+    clean(session.customer_last_name, 100);
 
   return {
     event_name: upsell
@@ -714,207 +996,289 @@ function buildEvent(raw, req) {
       : MAIN_EVENT_NAME,
 
     email,
+    first_name: firstName,
+    last_name: lastName,
+
+    full_name:
+      customer.fullName ||
+      clean(`${firstName} ${lastName}`, 220),
+
+    phone:
+      customer.phone ||
+      clean(session.customer_phone, 100),
 
     ip:
-      pick(data, ["CUSTOMER_IP"]) ||
-      req.headers[
-        "x-forwarded-for"
-      ]?.split(",")[0]?.trim() ||
-      "",
+      pick(data, ["CUSTOMER_IP"], 100) ||
+      clean(requestContext.ip_address, 100) ||
+      getRequestIp(req),
 
     user_agent:
-      req.headers["user-agent"] || "",
+      clean(requestContext.user_agent, 1500) ||
+      clean(req.headers["user-agent"], 1500),
+
+    comet_token: cometToken,
+    fingerprint,
 
     event_time: getEventTime(data),
+    url: getEventUrl(session, data),
 
-    url:
-      pick(data, [
-        "x-checkout_page_url",
-        "checkout_page_url",
-        "ORDER_REFERRER_URL"
-      ]) || "",
-
-    amount: getAmount(data),
+    amount,
     currency: getCurrency(data),
 
-    order_id: itemId
-      ? `${orderId}-${itemId}`
-      : orderId,
+    order_id: orderId,
 
     order_name:
-      pick(data, ["ORDER_ITEM_NAME"]) ||
-      "PayPro Order",
+      pick(data, ["ORDER_ITEM_NAME"], 500) ||
+      (upsell
+        ? "PayPro Upsell"
+        : "AccelStretch System"),
 
-    tracking_id: trackingId,
+    tracking_id:
+      cometlyClickId ||
+      cometToken ||
+      checkoutIntentId ||
+      fbc ||
+      fbp ||
+      fbclid ||
+      email ||
+      orderId,
+
     checkout_token: checkoutIntentId,
     is_upsell: upsell,
 
-    upsell_common_id:
-      pick(data, [
-        "x-root_order_id",
-        "root_order_id",
-        "x-parent_order_id",
-        "parent_order_id"
-      ]) ||
-      sessionId ||
-      orderId,
+    upsell_common_id: rootOrderId || orderId,
+    idempotency_key: idempotencyKey,
 
-    idempotency_key: itemId
-      ? `paypro-${orderId}-${itemId}`
-      : `paypro-${orderId}-${productId}`,
-
-    first_name: pick(data, [
-      "CUSTOMER_FIRST_NAME"
-    ]),
-
-    last_name: pick(data, [
-      "CUSTOMER_LAST_NAME"
-    ]),
-
-    full_name: pick(data, [
-      "CUSTOMER_NAME"
-    ]),
-
-    phone: pick(data, [
-      "CUSTOMER_PHONE"
-    ]),
-
-    comet_source: pick(data, [
-      "x-utm_source",
-      "utm_source"
-    ]),
-
-    comet_network: pick(data, [
-      "x-utm_source",
-      "utm_source"
-    ]),
-
-    comet_campaign: pick(data, [
-      "x-utm_campaign",
-      "utm_campaign"
-    ]),
-
-    comet_ad_group: pick(data, [
-      "x-utm_content",
-      "utm_content"
-    ]),
-
+    comet_source: utmSource,
+    comet_network: utmSource,
+    comet_campaign: utmCampaign,
+    comet_ad_group: utmContent,
     comet_ad_id: fbclid,
-
-    comet_keyword: pick(data, [
-      "x-utm_term",
-      "utm_term"
-    ]),
-
-    comet_type: pick(data, [
-      "x-utm_medium",
-      "utm_medium"
-    ]),
+    comet_keyword: utmTerm,
+    comet_type: utmMedium,
 
     profile_field_1: "paypro",
 
-    profile_field_2: pick(data, [
-      "x-funnel_id",
-      "funnel_id"
-    ]),
+    profile_field_2:
+      clean(session.funnel_id, 200) ||
+      "accelstretch_paypro_flow",
 
     profile_field_3:
-      pick(data, [
-        "x-offer_step",
-        "offer_step"
-      ]) ||
+      getOfferStep(data) ||
       (upsell ? "upsell" : "checkout_main"),
 
     profile_field_4: productId,
+    profile_field_5: pick(data, ["ORDER_ITEM_SKU"], 300),
+    profile_field_6: pick(data, ["ORDER_ITEM_NAME"], 500),
+    profile_field_7: pick(data, ["PAYMENT_METHOD_NAME"], 200),
 
-    profile_field_5: pick(data, [
-      "ORDER_ITEM_SKU"
-    ]),
+    profile_field_8: pick(
+      data,
+      [
+        "CUSTOMER_COUNTRY_CODE",
+        "CUSTOMER_COUNTRY_CODE_BY_IP"
+      ],
+      20
+    ),
 
-    profile_field_6: pick(data, [
-      "ORDER_ITEM_NAME"
-    ]),
-
-    profile_field_7: pick(data, [
-      "PAYMENT_METHOD_NAME"
-    ]),
-
-    profile_field_8: pick(data, [
-      "CUSTOMER_COUNTRY_CODE",
-      "CUSTOMER_COUNTRY_CODE_BY_IP"
-    ]),
-
-    profile_field_9: pick(data, [
-      "x-selected_order_bumps",
-      "selected_order_bumps"
-    ]),
+    profile_field_9: pick(
+      data,
+      ["x-selected_order_bumps", "selected_order_bumps"],
+      500
+    ),
 
     profile_field_10: fbclid,
     profile_field_11: fbc,
     profile_field_12: fbp,
+    profile_field_13: gclid,
+    profile_field_14: ttclid,
+    profile_field_15: "secure_session_v1",
 
-    profile_field_13: pick(data, [
-      "x-gclid",
-      "gclid"
-    ]),
+    fs_session_id: sessionId,
+    fs_checkout_intent_id: checkoutIntentId
+  };
+}
 
-    profile_field_14: pick(data, [
-      "x-ttclid",
-      "ttclid"
-    ]),
+async function releaseLock(lockKey, lockToken) {
+  if (!lockKey || !lockToken) {
+    return;
+  }
 
-    profile_field_15: sanitizeQueryString(
-      data.CHECKOUT_QUERY_STRING
+  await redisCommand([
+    "EVAL",
+    RELEASE_LOCK_SCRIPT,
+    "1",
+    lockKey,
+    lockToken
+  ]);
+}
+
+async function sendCometlyEvent(event) {
+  const apiKey = clean(
+    process.env.COMETLY_API_KEY,
+    4000
+  );
+
+  if (!apiKey) {
+    throw new Error("Missing COMETLY_API_KEY");
+  }
+
+  const sentKey = cometlySentKey(
+    event.idempotency_key
+  );
+
+  const existingResult = parseStoredRecord(
+    await redisCommand(["GET", sentKey])
+  );
+
+  if (existingResult?.sent === true) {
+    return {
+      sent: true,
+      alreadySent: true
+    };
+  }
+
+  const lockKey = cometlyLockKey(
+    event.idempotency_key
+  );
+
+  const lockToken = createHash("sha256")
+    .update(
+      `${event.idempotency_key}:${Date.now()}:${Math.random()}`,
+      "utf8"
+    )
+    .digest("hex");
+
+  const lockResult = await redisCommand([
+    "SET",
+    lockKey,
+    lockToken,
+    "NX",
+    "EX",
+    String(COMETLY_LOCK_SECONDS)
+  ]);
+
+  if (lockResult !== "OK") {
+    return {
+      sent: false,
+      processing: true
+    };
+  }
+
+  try {
+    const controller = new AbortController();
+
+    const timeoutId = setTimeout(
+      () => controller.abort(),
+      10000
+    );
+
+    let response;
+    let responseText = "";
+
+    try {
+      response = await fetch(COMETLY_API_URL, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          Accept: "application/json",
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify(event),
+        signal: controller.signal
+      });
+
+      responseText = await response.text();
+    } finally {
+      clearTimeout(timeoutId);
+    }
+
+    if (!response.ok) {
+      console.error("COMETLY EVENT REJECTED", {
+        status: response.status,
+        event_name: event.event_name,
+        order_id: event.order_id,
+        response: clean(responseText, 1000)
+      });
+
+      throw new Error(
+        `Cometly rejected event with HTTP ${response.status}`
+      );
+    }
+
+    await redisCommand([
+      "SET",
+      sentKey,
+      JSON.stringify({
+        sent: true,
+        event_name: event.event_name,
+        order_id: event.order_id,
+        sent_at: new Date().toISOString()
+      }),
+      "EX",
+      String(COMETLY_EVENT_TTL_SECONDS)
+    ]);
+
+    await releaseLock(lockKey, lockToken);
+
+    return {
+      sent: true,
+      alreadySent: false
+    };
+  } catch (error) {
+    try {
+      await releaseLock(lockKey, lockToken);
+    } catch {}
+
+    throw error;
+  }
+}
+
+function buildSafeLog(data) {
+  const { sessionId, checkoutIntentId } =
+    getSessionIdentifiers(data);
+
+  return {
+    order_id: pick(data, ["ORDER_ID"], 200),
+    product_id: pick(data, ["PRODUCT_ID"], 100),
+    order_item_id: pick(data, ["ORDER_ITEM_ID"], 200),
+    order_status: pick(data, ["ORDER_STATUS"], 200),
+    ipn_type: pick(data, ["IPN_TYPE_NAME"], 200),
+    test_mode: pick(data, ["TEST_MODE"], 20),
+    customer_email: maskEmail(data.CUSTOMER_EMAIL),
+    has_session_id: Boolean(sessionId),
+    has_checkout_intent_id: Boolean(checkoutIntentId),
+    offer_step: getOfferStep(data),
+    has_checkout_query_string: Boolean(
+      clean(data.CHECKOUT_QUERY_STRING, 10)
+    ),
+    has_order_custom_fields: Boolean(
+      clean(data.ORDER_CUSTOM_FIELDS, 10)
     )
   };
 }
 
-function buildSafeLog(raw) {
-  const data = mergePayProData(raw);
-
-  return {
-    ORDER_ID: data.ORDER_ID,
-    PRODUCT_ID: data.PRODUCT_ID,
-    ORDER_ITEM_ID: data.ORDER_ITEM_ID,
-    ORDER_ITEM_NAME: data.ORDER_ITEM_NAME,
-    ORDER_ITEM_SKU: data.ORDER_ITEM_SKU,
-    ORDER_STATUS: data.ORDER_STATUS,
-    IPN_TYPE_NAME: data.IPN_TYPE_NAME,
-    TEST_MODE: data.TEST_MODE,
-
-    CUSTOMER_EMAIL: maskEmail(
-      data.CUSTOMER_EMAIL
-    ),
-
-    PAYMENT_METHOD_NAME:
-      data.PAYMENT_METHOD_NAME,
-
-    ORDER_CURRENCY_CODE:
-      data.ORDER_CURRENCY_CODE,
-
-    VENDOR_BALANCE_CURRENCY_CODE:
-      data.VENDOR_BALANCE_CURRENCY_CODE,
-
-    ORDER_ITEM_TOTAL_AMOUNT:
-      data.ORDER_ITEM_TOTAL_AMOUNT,
-
-    ORDER_TOTAL_AMOUNT_SHOWN:
-      data.ORDER_TOTAL_AMOUNT_SHOWN,
-
-    ORDER_CUSTOM_FIELDS:
-      sanitizeQueryString(
-        data.ORDER_CUSTOM_FIELDS
-      ),
-
-    CHECKOUT_QUERY_STRING:
-      sanitizeQueryString(
-        data.CHECKOUT_QUERY_STRING
-      )
-  };
+function sendSkipped(res, reason, extra = {}) {
+  return res.status(200).json({
+    ok: true,
+    skipped: true,
+    sent_to_cometly: false,
+    reason,
+    ...extra
+  });
 }
 
 export default async function handler(req, res) {
+  res.setHeader(
+    "Cache-Control",
+    "no-store, max-age=0"
+  );
+
+  res.setHeader("X-Content-Type-Options", "nosniff");
+
   if (req.method !== "POST") {
+    res.setHeader("Allow", "POST");
+
     return res.status(405).json({
       ok: false,
       error: "Method not allowed"
@@ -922,26 +1286,22 @@ export default async function handler(req, res) {
   }
 
   try {
-    const raw = normalizeBody(req.body);
+    const data = mergePayProData(req.body);
 
     console.log(
-      "PAYPRO SAFE RAW:",
-      buildSafeLog(raw)
+      "PAYPRO IPN RECEIVED",
+      buildSafeLog(data)
     );
-
-    const data = mergePayProData(raw);
 
     if (!verifyPayProSignature(data)) {
       console.error(
         "PAYPRO WEBHOOK SIGNATURE REJECTED",
         {
+          order_id: pick(data, ["ORDER_ID"], 200),
+          ipn_type: pick(data, ["IPN_TYPE_NAME"], 200),
           has_signature: Boolean(
-            pick(data, ["SIGNATURE"])
-          ),
-          order_id: pick(data, ["ORDER_ID"]),
-          ipn_type: pick(data, [
-            "IPN_TYPE_NAME"
-          ])
+            pick(data, ["SIGNATURE"], 128)
+          )
         }
       );
 
@@ -951,165 +1311,153 @@ export default async function handler(req, res) {
       });
     }
 
-    const status = pick(data, [
-      "ORDER_STATUS"
-    ]);
+    const status = pick(
+      data,
+      ["ORDER_STATUS"],
+      200
+    ).toLowerCase();
 
-    const ipnType = pick(data, [
-      "IPN_TYPE_NAME"
-    ]);
+    const ipnType = pick(
+      data,
+      ["IPN_TYPE_NAME"],
+      200
+    ).toLowerCase();
 
-    const productId = pick(data, [
-      "PRODUCT_ID"
-    ]);
-
-    const orderId = pick(data, [
-      "ORDER_ID"
-    ]);
-
-    const itemId = pick(data, [
-      "ORDER_ITEM_ID"
-    ]);
-
-    if (status && status !== "Processed") {
-      return res.status(200).json({
-        ok: true,
-        skipped: "Non processed order"
-      });
+    if (status && status !== "processed") {
+      return sendSkipped(
+        res,
+        "non_processed_order"
+      );
     }
 
-    if (
-      ipnType &&
-      ipnType !== "OrderCharged"
-    ) {
-      return res.status(200).json({
-        ok: true,
-        skipped: "Non charge IPN"
-      });
+    if (ipnType && ipnType !== "ordercharged") {
+      return sendSkipped(res, "non_charge_ipn");
     }
 
-    const mappingSaved =
-      await persistMainCheckout(data);
+    const orderId = pick(data, ["ORDER_ID"], 200);
+    const productId = pick(data, ["PRODUCT_ID"], 100);
 
-    if (pick(data, ["TEST_MODE"]) === "1") {
-      console.log(
-        "PAYPRO TEST-MODE IPN VERIFIED",
+    if (isCheckoutBumpIpn(data)) {
+      return sendSkipped(
+        res,
+        "checkout_bump_item_ipn",
+        {
+          order_id: orderId,
+          product_id: productId
+        }
+      );
+    }
+
+    let authorization;
+    let eventKind;
+
+    if (isMainProductIpn(data)) {
+      authorization = await persistMainCheckout(data);
+      eventKind = "main";
+    } else if (isUpsellIpn(data)) {
+      authorization = await authorizeUpsell(data);
+      eventKind = "upsell";
+    } else {
+      return sendSkipped(
+        res,
+        "unrecognized_product_or_offer_step",
+        {
+          order_id: orderId,
+          product_id: productId
+        }
+      );
+    }
+
+    if (!authorization.authorized) {
+      console.warn(
+        "PAYPRO SECURE SESSION REJECTED",
         {
           order_id: orderId,
           product_id: productId,
-          mapping_saved: mappingSaved
+          event_kind: eventKind,
+          reason: authorization.reason
         }
       );
 
+      return sendSkipped(
+        res,
+        "secure_session_rejected",
+        {
+          order_id: orderId,
+          product_id: productId
+        }
+      );
+    }
+
+    console.log(
+      "PAYPRO SECURE SESSION VERIFIED",
+      {
+        order_id: orderId,
+        product_id: productId,
+        event_kind: eventKind,
+        checkout_completed:
+          authorization.session.checkout_completed === true
+      }
+    );
+
+    if (isTestMode(data)) {
       return res.status(200).json({
         ok: true,
         test_mode: true,
-        mapping_saved: mappingSaved,
+        mapping_saved: eventKind === "main",
+        secure_session_verified: true,
         sent_to_cometly: false
       });
     }
 
-    if (shouldSkipCheckoutBumpIpn(data)) {
-      console.log(
-        "PAYPRO CHECKOUT BUMP IPN SKIPPED:",
-        {
-          ORDER_ID: orderId,
-          PRODUCT_ID: productId,
-          ORDER_ITEM_ID: itemId,
-          ORDER_ITEM_NAME:
-            data.ORDER_ITEM_NAME,
-          ORDER_ITEM_SKU:
-            data.ORDER_ITEM_SKU
-        }
-      );
+    const event = buildCometlyEvent(
+      data,
+      req,
+      authorization.session,
+      eventKind
+    );
 
+    console.log("COMETLY EVENT PREPARED", {
+      event_name: event.event_name,
+      order_id: event.order_id,
+      amount: event.amount,
+      currency: event.currency,
+      email: maskEmail(event.email),
+      has_first_name: Boolean(event.first_name),
+      has_last_name: Boolean(event.last_name),
+      has_phone: Boolean(event.phone),
+      has_comet_token: Boolean(event.comet_token),
+      has_fingerprint: Boolean(event.fingerprint),
+      has_ip: Boolean(event.ip),
+      has_user_agent: Boolean(event.user_agent),
+      url: event.url
+    });
+
+    const delivery = await sendCometlyEvent(event);
+
+    if (delivery.processing) {
       return res.status(200).json({
         ok: true,
         sent_to_cometly: false,
-        mapping_saved: mappingSaved,
-        skipped: true,
-        reason:
-          "checkout_bump_item_ipn_skipped",
-        order_id: orderId,
-        product_id: productId,
-        item_id: itemId
-      });
-    }
-
-    const apiKey = process.env.COMETLY_API_KEY;
-
-    if (!apiKey) {
-      throw new Error(
-        "Missing COMETLY_API_KEY"
-      );
-    }
-
-    const event = buildEvent(raw, req);
-
-    console.log("COMETLY PAYLOAD SAFE:", {
-      event_name: event.event_name,
-      email: maskEmail(event.email),
-      amount: event.amount,
-      currency: event.currency,
-      order_id: event.order_id,
-      is_upsell: event.is_upsell,
-
-      tracking_id: event.tracking_id
-        ? "[present]"
-        : "",
-
-      checkout_token: event.checkout_token
-        ? "[present]"
-        : "",
-
-      profile_field_2:
-        event.profile_field_2,
-
-      profile_field_3:
-        event.profile_field_3
-    });
-
-    const response = await fetch(
-      COMETLY_API_URL,
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          Accept: "application/json",
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify(event)
-      }
-    );
-
-    const responseText =
-      await response.text();
-
-    console.log(
-      "COMETLY RESPONSE:",
-      response.status,
-      responseText
-    );
-
-    if (!response.ok) {
-      return res.status(500).json({
-        ok: false,
-        error: "Cometly rejected event",
-        status: response.status,
-        response: responseText
+        processing: true,
+        secure_session_verified: true,
+        event_name: event.event_name,
+        order_id: event.order_id
       });
     }
 
     return res.status(200).json({
       ok: true,
-      mapping_saved: mappingSaved,
-      sent_to_cometly: true,
+      mapping_saved: eventKind === "main",
+      secure_session_verified: true,
+      sent_to_cometly: delivery.sent,
+      already_sent: delivery.alreadySent,
       event_name: event.event_name,
       order_id: event.order_id
     });
   } catch (error) {
     console.error(
-      "WEBHOOK ERROR:",
+      "PAYPRO WEBHOOK ERROR",
       error instanceof Error
         ? error.message
         : "Unknown error"
@@ -1117,10 +1465,7 @@ export default async function handler(req, res) {
 
     return res.status(500).json({
       ok: false,
-      error:
-        error instanceof Error
-          ? error.message
-          : "Webhook processing failed"
+      error: "Webhook processing failed"
     });
   }
 }
