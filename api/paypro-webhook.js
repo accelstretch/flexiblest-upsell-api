@@ -21,8 +21,25 @@ const UPSELL_PRODUCT_IDS = new Set([
 ]);
 
 const SESSION_TTL_SECONDS = 72 * 60 * 60;
+const CHARGE_RESULT_TTL_SECONDS = 72 * 60 * 60;
+const DUPLICATE_CHARGE_AUDIT_TTL_SECONDS =
+  30 * 24 * 60 * 60;
 const COMETLY_EVENT_TTL_SECONDS = 30 * 24 * 60 * 60;
 const COMETLY_LOCK_SECONDS = 120;
+
+const REFERENCE_CHARGE_OFFERS = {
+  "133573": {
+    offerKey: "fasttrack57",
+    amount: 57,
+    currency: "USD"
+  },
+
+  "133574": {
+    offerKey: "fasttrack37",
+    amount: 37,
+    currency: "USD"
+  }
+};
 
 const RELEASE_LOCK_SCRIPT = `
 if redis.call("GET", KEYS[1]) == ARGV[1] then
@@ -134,6 +151,21 @@ function isPlainObject(value) {
 
 function funnelSessionKey(sessionId) {
   return `paypro:funnel:session:${sessionId}`;
+}
+
+function chargeResultKey(sessionId, offerKey) {
+  return `paypro:charge-result:${sessionId}:${offerKey}`;
+}
+
+function duplicateChargeAuditKey(
+  sessionId,
+  offerKey,
+  orderId
+) {
+  return (
+    `paypro:duplicate-charge:${sessionId}:` +
+    `${offerKey}:${orderId}`
+  );
 }
 
 function cometlySentKey(idempotencyKey) {
@@ -810,6 +842,133 @@ async function authorizeUpsell(data) {
   };
 }
 
+async function persistUpsellChargeResult(
+  data,
+  authorization
+) {
+  const orderId = pick(data, ["ORDER_ID"], 200);
+  const productId = pick(data, ["PRODUCT_ID"], 100);
+  const offer = REFERENCE_CHARGE_OFFERS[productId];
+
+  if (!offer) {
+    return {
+      applicable: false,
+      saved: false,
+      duplicate: false
+    };
+  }
+
+  if (!/^\d+$/.test(orderId)) {
+    throw new Error(
+      "Confirmed upsell contains an invalid PayPro order ID"
+    );
+  }
+
+  const sessionId = clean(
+    authorization.sessionId,
+    160
+  );
+
+  const checkoutIntentId = clean(
+    authorization.checkoutIntentId,
+    160
+  );
+
+  const referencedOrderId = clean(
+    authorization.rootOrderId,
+    200
+  );
+
+  const resultKey = chargeResultKey(
+    sessionId,
+    offer.offerKey
+  );
+
+  const record = {
+    charged: true,
+    offer: offer.offerKey,
+    orderId,
+    referencedOrderId,
+    fs_session_id: sessionId,
+    fs_checkout_intent_id: checkoutIntentId,
+    productId: Number(productId),
+    amount: getUpsellAmount(data) || offer.amount,
+    currency: getCurrency(data) || offer.currency,
+    createdAt: getEventTime(data),
+    recordedBy: "paypro_webhook"
+  };
+
+  const setResult = await redisCommand([
+    "SET",
+    resultKey,
+    JSON.stringify(record),
+    "NX",
+    "EX",
+    String(CHARGE_RESULT_TTL_SECONDS)
+  ]);
+
+  if (setResult === "OK") {
+    return {
+      applicable: true,
+      saved: true,
+      alreadyRecorded: false,
+      duplicate: false,
+      offerKey: offer.offerKey
+    };
+  }
+
+  const existingRecord = parseStoredRecord(
+    await redisCommand(["GET", resultKey])
+  );
+
+  if (existingRecord?.charged !== true) {
+    throw new Error(
+      "Existing upsell charge result is invalid"
+    );
+  }
+
+  const existingOrderId = clean(
+    existingRecord.orderId,
+    200
+  );
+
+  const duplicate = Boolean(
+    existingOrderId &&
+    !safeEqual(existingOrderId, orderId)
+  );
+
+  if (duplicate) {
+    await redisCommand([
+      "SET",
+      duplicateChargeAuditKey(
+        sessionId,
+        offer.offerKey,
+        orderId
+      ),
+      JSON.stringify({
+        duplicate_charge_detected: true,
+        offer: offer.offerKey,
+        first_order_id: existingOrderId,
+        duplicate_order_id: orderId,
+        referenced_order_id: referencedOrderId,
+        product_id: productId,
+        detected_at: new Date().toISOString()
+      }),
+      "EX",
+      String(DUPLICATE_CHARGE_AUDIT_TTL_SECONDS)
+    ]);
+  }
+
+  return {
+    applicable: true,
+    saved: false,
+    alreadyRecorded: !duplicate,
+    duplicate,
+    offerKey: offer.offerKey,
+    existingOrderId
+  };
+}
+
 function getAttributionValue(session, data, keys) {
   const attribution = isPlainObject(session?.attribution)
     ? session.attribution
@@ -1410,6 +1569,50 @@ export default async function handler(req, res) {
       });
     }
 
+    let chargeRecovery = null;
+
+    if (eventKind === "upsell") {
+      chargeRecovery =
+        await persistUpsellChargeResult(
+          data,
+          authorization
+        );
+
+      if (chargeRecovery.duplicate) {
+        console.error(
+          "PAYPRO DUPLICATE UPSELL CHARGE DETECTED",
+          {
+            order_id: orderId,
+            original_order_id:
+              chargeRecovery.existingOrderId,
+            product_id: productId,
+            offer: chargeRecovery.offerKey
+          }
+        );
+
+        return res.status(200).json({
+          ok: true,
+          duplicate_charge_detected: true,
+          secure_session_verified: true,
+          sent_to_cometly: false,
+          order_id: orderId
+        });
+      }
+
+      console.log(
+        "PAYPRO UPSELL CHARGE RECOVERY SAVED",
+        {
+          order_id: orderId,
+          product_id: productId,
+          offer: chargeRecovery.offerKey || "",
+          applicable: chargeRecovery.applicable,
+          saved: chargeRecovery.saved,
+          already_recorded:
+            chargeRecovery.alreadyRecorded === true
+        }
+      );
+    }
+
     const event = buildCometlyEvent(
       data,
       req,
@@ -1450,6 +1653,8 @@ export default async function handler(req, res) {
       ok: true,
       mapping_saved: eventKind === "main",
       secure_session_verified: true,
+      charge_recovery_saved:
+        chargeRecovery?.saved === true,
       sent_to_cometly: delivery.sent,
       already_sent: delivery.alreadySent,
       event_name: event.event_name,
