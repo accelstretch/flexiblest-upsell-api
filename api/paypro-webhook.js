@@ -116,6 +116,37 @@ redis.call(
 return cjson.encode(session)
 `;
 
+const CONFIRM_CHARGE_RESULT_SCRIPT = `
+local raw = redis.call("GET", KEYS[1])
+
+if raw then
+  local ok, existing = pcall(cjson.decode, raw)
+
+  if ok and type(existing) == "table" and
+     existing["charged"] == true then
+    return cjson.encode({
+      outcome = "existing",
+      record = existing
+    })
+  end
+end
+
+local record = cjson.decode(ARGV[1])
+
+redis.call(
+  "SET",
+  KEYS[1],
+  ARGV[1],
+  "EX",
+  ARGV[2]
+)
+
+return cjson.encode({
+  outcome = "saved",
+  record = record
+})
+`;
+
 function clean(value, maxLength = 2000) {
   return String(value ?? "")
     .replace(/[\u0000-\u001f\u007f]/g, " ")
@@ -157,6 +188,10 @@ function chargeResultKey(sessionId, offerKey) {
   return `paypro:charge-result:${sessionId}:${offerKey}`;
 }
 
+function manualCheckoutKey(token) {
+  return `paypro:manual-checkout:${token}`;
+}
+
 function duplicateChargeAuditKey(
   sessionId,
   offerKey,
@@ -183,6 +218,16 @@ function isValidSessionIdentifier(value) {
     identifier.length >= 20 &&
     identifier.length <= 160 &&
     /^[A-Za-z0-9_-]+$/.test(identifier)
+  );
+}
+
+function isValidFallbackToken(value) {
+  const token = clean(value, 160);
+
+  return (
+    token.length >= 32 &&
+    token.length <= 160 &&
+    /^[A-Za-z0-9_-]+$/.test(token)
   );
 }
 
@@ -609,6 +654,16 @@ async function readJsonFromRedis(key) {
   return parsed;
 }
 
+async function writeJsonToRedis(key, value, ttlSeconds) {
+  await redisCommand([
+    "SET",
+    key,
+    JSON.stringify(value),
+    "EX",
+    String(ttlSeconds)
+  ]);
+}
+
 function sessionIdentityMatches(
   session,
   sessionId,
@@ -842,6 +897,118 @@ async function authorizeUpsell(data) {
   };
 }
 
+async function authorizeManualUpsell(data) {
+  const fallbackToken = pick(
+    data,
+    ["x-fallback_token", "fallback_token"],
+    160
+  );
+
+  if (!isValidFallbackToken(fallbackToken)) {
+    return {
+      authorized: false,
+      reason: "missing_or_invalid_fallback_token"
+    };
+  }
+
+  const fallbackRecord = await readJsonFromRedis(
+    manualCheckoutKey(fallbackToken)
+  );
+
+  if (
+    !fallbackRecord ||
+    !["ready", "confirmed"].includes(fallbackRecord.status) ||
+    !isValidSessionIdentifier(
+      fallbackRecord.fs_session_id
+    ) ||
+    !isValidSessionIdentifier(
+      fallbackRecord.fs_checkout_intent_id
+    )
+  ) {
+    return {
+      authorized: false,
+      reason: "invalid_or_expired_fallback_record"
+    };
+  }
+
+  const productId = pick(data, ["PRODUCT_ID"], 100);
+  const offer = REFERENCE_CHARGE_OFFERS[productId];
+
+  if (
+    !offer ||
+    Number(fallbackRecord.productId) !== Number(productId) ||
+    !safeEqual(fallbackRecord.offer, offer.offerKey)
+  ) {
+    return {
+      authorized: false,
+      reason: "fallback_product_mismatch"
+    };
+  }
+
+  const session = await readJsonFromRedis(
+    funnelSessionKey(fallbackRecord.fs_session_id)
+  );
+
+  if (
+    !sessionIdentityMatches(
+      session,
+      fallbackRecord.fs_session_id,
+      fallbackRecord.fs_checkout_intent_id
+    ) ||
+    session.status !== "paid" ||
+    session.checkout_completed !== true ||
+    !safeEqual(
+      session.paypro_root_order_id,
+      fallbackRecord.referencedOrderId
+    )
+  ) {
+    return {
+      authorized: false,
+      reason: "fallback_secure_session_mismatch"
+    };
+  }
+
+  return {
+    authorized: true,
+    manualFallback: true,
+    fallbackToken,
+    session,
+    sessionId: fallbackRecord.fs_session_id,
+    checkoutIntentId:
+      fallbackRecord.fs_checkout_intent_id,
+    rootOrderId: fallbackRecord.referencedOrderId
+  };
+}
+
+async function markManualCheckoutConfirmed(
+  fallbackToken,
+  offerKey,
+  orderId
+) {
+  if (!isValidFallbackToken(fallbackToken)) {
+    return;
+  }
+
+  const key = manualCheckoutKey(fallbackToken);
+  const existingRecord = await readJsonFromRedis(key);
+
+  if (!existingRecord) {
+    return;
+  }
+
+  await writeJsonToRedis(
+    key,
+    {
+      ...existingRecord,
+      status: "confirmed",
+      offer: offerKey,
+      confirmedOrderId: orderId,
+      confirmedAt: new Date().toISOString()
+    },
+    CHARGE_RESULT_TTL_SECONDS
+  );
+}
+
 async function persistUpsellChargeResult(
   data,
   authorization
@@ -885,7 +1052,9 @@ async function persistUpsellChargeResult(
   );
 
   const record = {
+    status: "confirmed",
     charged: true,
+    confirmedByIpn: true,
     offer: offer.offerKey,
     orderId,
     referencedOrderId,
@@ -898,16 +1067,37 @@ async function persistUpsellChargeResult(
     recordedBy: "paypro_webhook"
   };
 
-  const setResult = await redisCommand([
-    "SET",
+  if (authorization.manualFallback === true) {
+    record.manualFallback = true;
+  }
+
+  const confirmationResult = parseStoredRecord(
+    await redisCommand([
+    "EVAL",
+    CONFIRM_CHARGE_RESULT_SCRIPT,
+    "1",
     resultKey,
     JSON.stringify(record),
-    "NX",
-    "EX",
     String(CHARGE_RESULT_TTL_SECONDS)
-  ]);
+  ])
+  );
 
-  if (setResult === "OK") {
+  if (
+    confirmationResult?.outcome === "saved"
+  ) {
+    if (
+      authorization.manualFallback === true &&
+      isValidFallbackToken(
+        authorization.fallbackToken
+      )
+    ) {
+      await markManualCheckoutConfirmed(
+        authorization.fallbackToken,
+        offer.offerKey,
+        orderId
+      );
+    }
+
     return {
       applicable: true,
       saved: true,
@@ -918,7 +1108,7 @@ async function persistUpsellChargeResult(
   }
 
   const existingRecord = parseStoredRecord(
-    await redisCommand(["GET", resultKey])
+    confirmationResult?.record
   );
 
   if (existingRecord?.charged !== true) {
@@ -931,6 +1121,21 @@ async function persistUpsellChargeResult(
     existingRecord.orderId,
     200
   );
+
+  if (
+    authorization.manualFallback === true &&
+    isValidFallbackToken(
+      authorization.fallbackToken
+    ) &&
+    existingOrderId &&
+    safeEqual(existingOrderId, orderId)
+  ) {
+    await markManualCheckoutConfirmed(
+      authorization.fallbackToken,
+      offer.offerKey,
+      orderId
+    );
+  }
 
   const duplicate = Boolean(
     existingOrderId &&
@@ -1510,9 +1715,21 @@ export default async function handler(req, res) {
     let authorization;
     let eventKind;
 
+    const fallbackToken = pick(
+      data,
+      ["x-fallback_token", "fallback_token"],
+      160
+    );
+
     if (isMainProductIpn(data)) {
       authorization = await persistMainCheckout(data);
       eventKind = "main";
+    } else if (
+      isUpsellIpn(data) &&
+      isValidFallbackToken(fallbackToken)
+    ) {
+      authorization = await authorizeManualUpsell(data);
+      eventKind = "upsell";
     } else if (isUpsellIpn(data)) {
       authorization = await authorizeUpsell(data);
       eventKind = "upsell";
@@ -1560,10 +1777,22 @@ export default async function handler(req, res) {
     );
 
     if (isTestMode(data)) {
+      let testChargeRecovery = null;
+
+      if (eventKind === "upsell") {
+        testChargeRecovery =
+          await persistUpsellChargeResult(
+            data,
+            authorization
+          );
+      }
+
       return res.status(200).json({
         ok: true,
         test_mode: true,
         mapping_saved: eventKind === "main",
+        charge_recovery_saved:
+          testChargeRecovery?.saved === true,
         secure_session_verified: true,
         sent_to_cometly: false
       });
