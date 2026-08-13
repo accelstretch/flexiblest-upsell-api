@@ -1,28 +1,11 @@
 import crypto from "crypto";
 
 const SESSION_TTL_SECONDS = 72 * 60 * 60;
-const MAX_REQUEST_BODY_BYTES = 8 * 1024;
-const MAX_UPDATE_ATTEMPTS = 4;
+const MAX_REQUEST_BODY_BYTES = 32 * 1024;
 
-const DEFAULT_ALLOWED_ORIGINS = [
-  "https://flexiblest.com",
-  "https://www.flexiblest.com"
-];
-
-const COMPARE_AND_SET_SESSION_SCRIPT = `
-local current = redis.call("GET", KEYS[1])
-
-if not current then
-  return 0
-end
-
-if current ~= ARGV[1] then
-  return -1
-end
-
-redis.call("SET", KEYS[1], ARGV[2], "KEEPTTL")
-return 1
-`;
+const FUNNEL_ID = "accelstretch_paypro_flow";
+const SOURCE_PRODUCT = "accelstretch";
+const INITIAL_OFFER_STEP = "checkout_main";
 
 class ClientError extends Error {
   constructor(statusCode, message) {
@@ -32,8 +15,50 @@ class ClientError extends Error {
   }
 }
 
-function funnelSessionKey(sessionId) {
-  return `paypro:funnel:session:${sessionId}`;
+function clean(value, maxLength = 500) {
+  return String(value || "")
+    .replace(/[\u0000-\u001f\u007f]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, maxLength);
+}
+
+function normalizeEmail(value) {
+  return clean(value, 254).toLowerCase();
+}
+
+function validEmail(value) {
+  const email = normalizeEmail(value);
+
+  return (
+    email.length >= 3 &&
+    email.length <= 254 &&
+    /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)
+  );
+}
+
+function normalizeName(value) {
+  return clean(value, 100);
+}
+
+function validIdentifier(value) {
+  return /^[A-Za-z0-9_-]{20,160}$/.test(clean(value, 160));
+}
+
+function isPlainObject(value) {
+  return (
+    value !== null &&
+    typeof value === "object" &&
+    !Array.isArray(value)
+  );
+}
+
+function makeOpaqueId(prefix) {
+  return `${prefix}_${crypto.randomUUID().replace(/-/g, "")}`;
+}
+
+function makeAccessToken() {
+  return crypto.randomBytes(32).toString("base64url");
 }
 
 function hashAccessToken(token) {
@@ -56,223 +81,29 @@ function safeEqual(left, right) {
 function getBearerToken(req) {
   const authorization = String(req.headers.authorization || "");
   const match = authorization.match(/^Bearer\s+(.+)$/i);
+
   return match ? match[1].trim() : "";
 }
 
-function normalizeOrigin(value) {
-  try {
-    const parsed = new URL(String(value || "").trim());
-
-    if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
-      return "";
-    }
-
-    return parsed.origin;
-  } catch {
-    return "";
-  }
-}
-
-function getAllowedOrigins() {
-  const configuredOrigins = String(
-    process.env.PAYPRO_FUNNEL_ALLOWED_ORIGINS || ""
-  )
-    .split(",")
-    .map(normalizeOrigin)
-    .filter(Boolean);
-
-  return new Set([
-    ...DEFAULT_ALLOWED_ORIGINS.map(normalizeOrigin),
-    ...configuredOrigins
-  ]);
-}
-
-const ALLOWED_ORIGINS = getAllowedOrigins();
-
-function applyResponseHeaders(req, res) {
-  const requestOrigin = String(req.headers.origin || "").trim();
-  const normalizedRequestOrigin = normalizeOrigin(requestOrigin);
-
-  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
-  res.setHeader("Pragma", "no-cache");
-  res.setHeader("Expires", "0");
-  res.setHeader("Vary", "Origin");
-  res.setHeader("X-Content-Type-Options", "nosniff");
-
-  if (
-    normalizedRequestOrigin &&
-    ALLOWED_ORIGINS.has(normalizedRequestOrigin)
-  ) {
-    res.setHeader("Access-Control-Allow-Origin", normalizedRequestOrigin);
-  }
-}
-
-function isRequestOriginAllowed(req) {
-  const requestOrigin = String(req.headers.origin || "").trim();
-
-  // Requests without Origin are allowed for direct server-side testing.
-  if (!requestOrigin) {
-    return true;
-  }
-
-  const normalizedRequestOrigin = normalizeOrigin(requestOrigin);
-
-  return (
-    Boolean(normalizedRequestOrigin) &&
-    ALLOWED_ORIGINS.has(normalizedRequestOrigin)
-  );
-}
-
-function sendJson(res, statusCode, payload) {
-  res.statusCode = statusCode;
-  res.setHeader("Content-Type", "application/json; charset=utf-8");
-  res.end(JSON.stringify(payload));
-}
-
-function parseRequestBody(req) {
-  let body = req.body;
-
-  if (body === undefined || body === null || body === "") {
-    return {};
-  }
-
-  if (Buffer.isBuffer(body)) {
-    if (body.length > MAX_REQUEST_BODY_BYTES) {
-      throw new ClientError(413, "Request body is too large.");
-    }
-
-    body = body.toString("utf8");
-  }
-
-  if (typeof body === "string") {
-    if (Buffer.byteLength(body, "utf8") > MAX_REQUEST_BODY_BYTES) {
-      throw new ClientError(413, "Request body is too large.");
-    }
-
-    try {
-      body = JSON.parse(body);
-    } catch {
-      throw new ClientError(400, "Request body must contain valid JSON.");
-    }
-  }
-
-  if (
-    typeof body !== "object" ||
-    Array.isArray(body) ||
-    body === null
-  ) {
-    throw new ClientError(400, "Request body must be a JSON object.");
-  }
-
-  let serializedBody;
-
-  try {
-    serializedBody = JSON.stringify(body);
-  } catch {
-    throw new ClientError(400, "Request body must contain valid JSON.");
-  }
-
-  if (
-    Buffer.byteLength(serializedBody, "utf8") >
-    MAX_REQUEST_BODY_BYTES
-  ) {
-    throw new ClientError(413, "Request body is too large.");
-  }
-
-  return body;
-}
-
-function normalizeIdentifier(value) {
-  const identifier = String(value || "").trim();
-
-  if (
-    identifier.length < 16 ||
-    identifier.length > 128 ||
-    !/^[A-Za-z0-9_-]+$/.test(identifier)
-  ) {
-    return "";
-  }
-
-  return identifier;
-}
-
-function normalizeEmail(value) {
-  const email = String(value || "").trim().toLowerCase();
-
-  if (
-    !email ||
-    Buffer.byteLength(email, "utf8") > 254 ||
-    /[\u0000-\u001f\u007f\s]/.test(email)
-  ) {
-    return "";
-  }
-
-  const atIndex = email.lastIndexOf("@");
-
-  if (
-    atIndex <= 0 ||
-    atIndex !== email.indexOf("@") ||
-    atIndex === email.length - 1
-  ) {
-    return "";
-  }
-
-  const localPart = email.slice(0, atIndex);
-  const domain = email.slice(atIndex + 1);
-
-  if (
-    Buffer.byteLength(localPart, "utf8") > 64 ||
-    localPart.startsWith(".") ||
-    localPart.endsWith(".") ||
-    localPart.includes("..") ||
-    domain.length > 253 ||
-    domain.startsWith(".") ||
-    domain.endsWith(".") ||
-    domain.includes("..")
-  ) {
-    return "";
-  }
-
-  const domainLabels = domain.split(".");
-
-  if (domainLabels.length < 2) {
-    return "";
-  }
-
-  const validDomain = domainLabels.every(
-    (label) =>
-      label.length > 0 &&
-      label.length <= 63 &&
-      /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/i.test(label)
-  );
-
-  if (!validDomain || !/^[^\s@]+$/.test(localPart)) {
-    return "";
-  }
-
-  return email;
+function funnelSessionKey(sessionId) {
+  return `paypro:funnel:session:${sessionId}`;
 }
 
 function getRedisConfiguration() {
-  const url = String(process.env.KV_REST_API_URL || "")
-    .trim()
-    .replace(/\/+$/, "");
-
-  const token = String(process.env.KV_REST_API_TOKEN || "").trim();
+  const url = clean(process.env.KV_REST_API_URL, 2000).replace(/\/+$/, "");
+  const token = clean(process.env.KV_REST_API_TOKEN, 4000);
 
   if (!url || !token) {
-    throw new Error(
-      "KV_REST_API_URL or KV_REST_API_TOKEN is not configured."
-    );
+    throw new Error("Redis environment variables are not configured.");
   }
 
   return { url, token };
 }
 
-async function runRedisCommand(command) {
+async function redisCommand(command) {
   const { url, token } = getRedisConfiguration();
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 8000);
+  const timeoutId = setTimeout(() => controller.abort(), 8000);
 
   try {
     const response = await fetch(url, {
@@ -285,256 +116,555 @@ async function runRedisCommand(command) {
       signal: controller.signal
     });
 
-    let payload;
+    const payload = await response.json().catch(() => null);
 
-    try {
-      payload = await response.json();
-    } catch {
-      throw new Error("Redis returned a non-JSON response.");
-    }
+    if (
+      !response.ok ||
+      !payload ||
+      Object.prototype.hasOwnProperty.call(payload, "error")
+    ) {
+      const redisMessage =
+        payload && payload.error
+          ? clean(payload.error, 500)
+          : `Redis returned HTTP ${response.status}.`;
 
-    if (!response.ok || payload.error) {
-      throw new Error(
-        `Redis command failed with HTTP ${response.status}.`
-      );
+      throw new Error(redisMessage);
     }
 
     return payload.result;
   } finally {
-    clearTimeout(timeout);
+    clearTimeout(timeoutId);
   }
 }
 
-async function createRedisSession(sessionId, session) {
-  const result = await runRedisCommand([
+async function readJsonFromRedis(key) {
+  const result = await redisCommand(["GET", key]);
+
+  if (result === null || result === undefined || result === "") {
+    return null;
+  }
+
+  if (isPlainObject(result)) {
+    return result;
+  }
+
+  try {
+    const parsed = JSON.parse(String(result));
+    return isPlainObject(parsed) ? parsed : null;
+  } catch (error) {
+    throw new Error("The stored funnel session is not valid JSON.");
+  }
+}
+
+async function writeNewJsonToRedis(key, value, ttlSeconds) {
+  const result = await redisCommand([
     "SET",
-    funnelSessionKey(sessionId),
-    JSON.stringify(session),
+    key,
+    JSON.stringify(value),
     "EX",
-    SESSION_TTL_SECONDS,
+    String(ttlSeconds),
     "NX"
   ]);
 
   return result === "OK";
 }
 
-async function readRedisSession(sessionId) {
-  const raw = await runRedisCommand([
-    "GET",
-    funnelSessionKey(sessionId)
+function getAllowedOrigins() {
+  const origins = new Set([
+    "https://flexiblest.com",
+    "https://www.flexiblest.com"
   ]);
 
-  if (raw === null || raw === undefined) {
-    return null;
+  const configuredValues = [
+    process.env.APP_BASE_URL,
+    process.env.ALLOWED_ORIGINS,
+    process.env.WEBFLOW_ALLOWED_ORIGINS
+  ]
+    .filter(Boolean)
+    .join(",")
+    .split(",")
+    .map((value) => clean(value, 2000))
+    .filter(Boolean);
+
+  configuredValues.forEach((value) => {
+    try {
+      const url = new URL(value);
+
+      if (url.protocol === "https:" || url.protocol === "http:") {
+        origins.add(url.origin);
+      }
+    } catch (error) {}
+  });
+
+  return origins;
+}
+
+function setCors(req, res) {
+  const origin = clean(req.headers.origin, 2000);
+  const allowedOrigins = getAllowedOrigins();
+  const originAllowed = !origin || allowedOrigins.has(origin);
+
+  if (origin && originAllowed) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
   }
 
-  if (typeof raw !== "string") {
-    throw new Error("Stored funnel session has an invalid format.");
+  res.setHeader("Vary", "Origin");
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "Content-Type, Authorization"
+  );
+  res.setHeader("Access-Control-Max-Age", "86400");
+  res.setHeader("Cache-Control", "no-store, max-age=0");
+  res.setHeader("Pragma", "no-cache");
+  res.setHeader("X-Content-Type-Options", "nosniff");
+
+  return originAllowed;
+}
+
+function sendJson(res, statusCode, body) {
+  res.status(statusCode).json(body);
+}
+
+function parseRequestBody(req) {
+  if (req.body === undefined || req.body === null || req.body === "") {
+    return {};
   }
 
-  let session;
+  let body = req.body;
+
+  if (typeof body === "string") {
+    if (Buffer.byteLength(body, "utf8") > MAX_REQUEST_BODY_BYTES) {
+      throw new ClientError(413, "Request body is too large.");
+    }
+
+    try {
+      body = JSON.parse(body);
+    } catch (error) {
+      throw new ClientError(400, "Request body must be valid JSON.");
+    }
+  } else {
+    let serialized;
+
+    try {
+      serialized = JSON.stringify(body);
+    } catch (error) {
+      throw new ClientError(400, "Request body must be valid JSON.");
+    }
+
+    if (
+      Buffer.byteLength(serialized || "", "utf8") >
+      MAX_REQUEST_BODY_BYTES
+    ) {
+      throw new ClientError(413, "Request body is too large.");
+    }
+  }
+
+  if (!isPlainObject(body)) {
+    throw new ClientError(400, "Request body must be a JSON object.");
+  }
+
+  return body;
+}
+
+function getRequestIp(req) {
+  const forwarded =
+    req.headers["x-vercel-forwarded-for"] ||
+    req.headers["x-forwarded-for"] ||
+    req.headers["x-real-ip"] ||
+    "";
+
+  return clean(String(forwarded).split(",")[0], 100);
+}
+
+function cleanPageUrl(value) {
+  const input = clean(value, 4000);
+
+  if (!input) {
+    return "";
+  }
 
   try {
-    session = JSON.parse(raw);
-  } catch {
-    throw new Error("Stored funnel session contains invalid JSON.");
-  }
+    const url = new URL(input);
 
-  if (
-    !session ||
-    typeof session !== "object" ||
-    Array.isArray(session)
-  ) {
-    throw new Error("Stored funnel session is not a JSON object.");
-  }
+    if (url.protocol !== "https:" && url.protocol !== "http:") {
+      return "";
+    }
 
-  return { raw, session };
+    /*
+     * Deliberately exclude the query string and fragment.
+     * Click IDs and UTM values are stored separately below.
+     * This prevents email, name, or other personal query parameters
+     * from being retained as event-source URLs.
+     */
+    return `${url.origin}${url.pathname}`;
+  } catch (error) {
+    return "";
+  }
 }
 
-async function compareAndSetRedisSession(
-  sessionId,
-  previousRaw,
-  updatedSession
-) {
-  const result = await runRedisCommand([
-    "EVAL",
-    COMPARE_AND_SET_SESSION_SCRIPT,
-    1,
-    funnelSessionKey(sessionId),
-    previousRaw,
-    JSON.stringify(updatedSession)
-  ]);
+function sanitizeAttribution(body) {
+  const nested = isPlainObject(body.attribution)
+    ? body.attribution
+    : isPlainObject(body.attribution_data)
+      ? body.attribution_data
+      : {};
 
-  return Number(result);
-}
+  function valueFor(...keys) {
+    for (const key of keys) {
+      if (nested[key] !== undefined && nested[key] !== null) {
+        return nested[key];
+      }
 
-function sessionCredentialsAreValid({
-  session,
-  sessionId,
-  checkoutIntentId,
-  accessToken
-}) {
-  if (
-    !session ||
-    !safeEqual(session.fs_session_id, sessionId) ||
-    !safeEqual(
-      session.fs_checkout_intent_id,
-      checkoutIntentId
+      if (body[key] !== undefined && body[key] !== null) {
+        return body[key];
+      }
+    }
+
+    return "";
+  }
+
+  const fields = {
+    comet_token: clean(
+      valueFor("comet_token", "cometly_token"),
+      1000
+    ),
+    comet_fingerprint: clean(
+      valueFor("comet_fingerprint", "cometly_fingerprint"),
+      1000
+    ),
+    cometly_click_id: clean(
+      valueFor("cometly_click_id", "cometly_id"),
+      500
+    ),
+
+    fbclid: clean(valueFor("fbclid"), 1000),
+    fbc: clean(valueFor("fbc", "_fbc"), 1000),
+    fbp: clean(valueFor("fbp", "_fbp"), 1000),
+
+    gclid: clean(valueFor("gclid"), 1000),
+    gbraid: clean(valueFor("gbraid"), 1000),
+    wbraid: clean(valueFor("wbraid"), 1000),
+    ttclid: clean(valueFor("ttclid"), 1000),
+
+    utm_source: clean(valueFor("utm_source"), 300),
+    utm_medium: clean(valueFor("utm_medium"), 300),
+    utm_campaign: clean(valueFor("utm_campaign"), 500),
+    utm_content: clean(valueFor("utm_content"), 500),
+    utm_term: clean(valueFor("utm_term"), 500),
+
+    campaign_id: clean(
+      valueFor("campaign_id", "utm_campaign_id"),
+      300
+    ),
+    adset_id: clean(valueFor("adset_id"), 300),
+    ad_id: clean(valueFor("ad_id"), 300),
+    placement: clean(valueFor("placement"), 300),
+    site_source_name: clean(valueFor("site_source_name"), 100),
+
+    landing_page_url: cleanPageUrl(
+      valueFor("landing_page_url")
+    ),
+    latest_page_url: cleanPageUrl(
+      valueFor("latest_page_url", "page_url")
+    ),
+    referrer_url: cleanPageUrl(
+      valueFor("referrer_url", "referrer")
     )
-  ) {
-    return false;
-  }
+  };
 
-  const storedHash = String(session.access_token_hash || "");
-  const suppliedHash = hashAccessToken(accessToken);
+  const result = {};
 
-  return (
-    storedHash.length === 64 &&
-    safeEqual(storedHash, suppliedHash)
-  );
+  Object.entries(fields).forEach(([key, value]) => {
+    if (value) {
+      result[key] = value;
+    }
+  });
+
+  return result;
 }
 
-async function createFunnelSession() {
-  for (let attempt = 0; attempt < 5; attempt += 1) {
-    const sessionId = crypto.randomUUID();
-    const checkoutIntentId = crypto.randomUUID();
-    const accessToken = crypto.randomBytes(32).toString("base64url");
-    const now = new Date();
-    const expiresAt = new Date(
-      now.getTime() + SESSION_TTL_SECONDS * 1000
-    );
+function getRequestContext(req, body) {
+  return {
+    ip_address: getRequestIp(req),
+    user_agent: clean(req.headers["user-agent"], 1500),
+    accept_language: clean(req.headers["accept-language"], 500),
+    page_url: cleanPageUrl(
+      body.page_url || body.checkout_page_url
+    ),
+    referrer_url: cleanPageUrl(
+      body.referrer_url || body.referrer
+    )
+  };
+}
+
+async function createFunnelSession(req, body) {
+  const now = new Date();
+  const createdAt = now.toISOString();
+  const expiresAt = new Date(
+    now.getTime() + SESSION_TTL_SECONDS * 1000
+  ).toISOString();
+
+  const attribution = sanitizeAttribution(body);
+  const requestContext = getRequestContext(req, body);
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const sessionId = makeOpaqueId("fsess");
+    const checkoutIntentId = makeOpaqueId("fchk");
+    const accessToken = makeAccessToken();
+    const accessTokenHash = hashAccessToken(accessToken);
 
     const session = {
       schema_version: 1,
+      session_type: "paypro_funnel",
+
       fs_session_id: sessionId,
       fs_checkout_intent_id: checkoutIntentId,
+      access_token_hash: accessTokenHash,
 
-      // Only the hash is persisted. The raw token is returned once.
-      access_token_hash: hashAccessToken(accessToken),
+      funnel_id: FUNNEL_ID,
+      source_product: SOURCE_PRODUCT,
+      offer_step: INITIAL_OFFER_STEP,
 
-      status: "pending",
+      status: "created",
+      checkout_started: true,
       checkout_completed: false,
-      checkout_email: null,
-      checkout_email_captured_at: null,
 
-      created_at: now.toISOString(),
-      updated_at: now.toISOString(),
-      expires_at: expiresAt.toISOString()
+      /*
+       * These remain empty until a valid parent-page form is added,
+       * or until PayPro sends the final identity in its validated IPN.
+       */
+      checkout_email: null,
+      checkout_first_name: null,
+      checkout_last_name: null,
+      precheckout_identity_captured: false,
+
+      paypro_root_order_id: null,
+      product_id: null,
+      customer_email: null,
+      customer_first_name: null,
+      customer_last_name: null,
+      currency: null,
+      amount: null,
+
+      attribution,
+      request_context: requestContext,
+
+      created_at: createdAt,
+      updated_at: createdAt,
+      expires_at: expiresAt
     };
 
-    const created = await createRedisSession(sessionId, session);
+    const key = funnelSessionKey(sessionId);
+    const created = await writeNewJsonToRedis(
+      key,
+      session,
+      SESSION_TTL_SECONDS
+    );
 
     if (created) {
       return {
         fs_session_id: sessionId,
         fs_checkout_intent_id: checkoutIntentId,
         fs_funnel_access_token: accessToken,
-        expires_in_seconds: SESSION_TTL_SECONDS
+        expires_in: SESSION_TTL_SECONDS,
+        expires_at: expiresAt
       };
     }
   }
 
-  throw new Error("Unable to allocate a unique funnel session.");
+  throw new Error("Unable to create a unique funnel session.");
 }
 
+const SAVE_CHECKOUT_IDENTITY_SCRIPT = `
+local raw = redis.call("GET", KEYS[1])
+
+if not raw then
+  return "MISSING"
+end
+
+local ok, session = pcall(cjson.decode, raw)
+
+if not ok or type(session) ~= "table" then
+  return "INVALID"
+end
+
+if tostring(session["fs_checkout_intent_id"] or "") ~= ARGV[1] then
+  return "INTENT_MISMATCH"
+end
+
+if tostring(session["access_token_hash"] or "") ~= ARGV[2] then
+  return "TOKEN_MISMATCH"
+end
+
+if session["checkout_completed"] == true or session["status"] == "paid" then
+  return "COMPLETED"
+end
+
+session["checkout_email"] = ARGV[3]
+session["precheckout_identity_captured"] = true
+session["precheckout_identity_captured_at"] = ARGV[7]
+
+if ARGV[4] ~= "" then
+  session["checkout_first_name"] = ARGV[4]
+end
+
+if ARGV[5] ~= "" then
+  session["checkout_last_name"] = ARGV[5]
+end
+
+if ARGV[6] ~= "" and ARGV[6] ~= "{}" then
+  local attributionOk, incomingAttribution =
+    pcall(cjson.decode, ARGV[6])
+
+  if attributionOk and type(incomingAttribution) == "table" then
+    if type(session["attribution"]) ~= "table" then
+      session["attribution"] = {}
+    end
+
+    for key, value in pairs(incomingAttribution) do
+      if value ~= nil and tostring(value) ~= "" then
+        session["attribution"][key] = value
+      end
+    end
+  end
+end
+
+session["updated_at"] = ARGV[7]
+session["expires_at"] = ARGV[8]
+
+redis.call(
+  "SET",
+  KEYS[1],
+  cjson.encode(session),
+  "EX",
+  ARGV[9]
+)
+
+return "OK"
+`;
+
 async function saveCheckoutEmail(req, body) {
-  const sessionId = normalizeIdentifier(body.fs_session_id);
-  const checkoutIntentId = normalizeIdentifier(
-    body.fs_checkout_intent_id
+  const sessionId = clean(body.fs_session_id, 160);
+  const checkoutIntentId = clean(
+    body.fs_checkout_intent_id,
+    160
   );
   const accessToken = getBearerToken(req);
-  const email = normalizeEmail(body.email);
-
-  if (!sessionId || !checkoutIntentId) {
-    throw new ClientError(
-      400,
-      "Valid funnel session identifiers are required."
-    );
-  }
+  const email = normalizeEmail(
+    body.email || body.checkout_email
+  );
+  const firstName = normalizeName(
+    body.first_name || body.checkout_first_name
+  );
+  const lastName = normalizeName(
+    body.last_name || body.checkout_last_name
+  );
 
   if (
-    accessToken.length < 20 ||
-    accessToken.length > 512
+    !validIdentifier(sessionId) ||
+    !validIdentifier(checkoutIntentId) ||
+    !accessToken ||
+    accessToken.length > 500
   ) {
     throw new ClientError(
       401,
-      "Invalid or expired funnel credentials."
+      "Invalid funnel session credentials."
     );
   }
 
-  if (!email) {
+  if (!validEmail(email)) {
     throw new ClientError(
       400,
       "A valid checkout email address is required."
     );
   }
 
-  for (
-    let attempt = 0;
-    attempt < MAX_UPDATE_ATTEMPTS;
-    attempt += 1
+  const key = funnelSessionKey(sessionId);
+  const session = await readJsonFromRedis(key);
+
+  if (
+    !session ||
+    session.fs_checkout_intent_id !== checkoutIntentId
   ) {
-    const stored = await readRedisSession(sessionId);
-
-    if (
-      !stored ||
-      !sessionCredentialsAreValid({
-        session: stored?.session,
-        sessionId,
-        checkoutIntentId,
-        accessToken
-      })
-    ) {
-      throw new ClientError(
-        401,
-        "Invalid or expired funnel credentials."
-      );
-    }
-
-    if (stored.session.checkout_email === email) {
-      return;
-    }
-
-    const now = new Date().toISOString();
-
-    const updatedSession = {
-      ...stored.session,
-      checkout_email: email,
-      checkout_email_captured_at: now,
-      updated_at: now
-    };
-
-    const updateResult = await compareAndSetRedisSession(
-      sessionId,
-      stored.raw,
-      updatedSession
+    throw new ClientError(
+      401,
+      "Invalid funnel session credentials."
     );
-
-    if (updateResult === 1) {
-      return;
-    }
-
-    if (updateResult === 0) {
-      throw new ClientError(
-        401,
-        "Invalid or expired funnel credentials."
-      );
-    }
-
-    // A webhook or another authenticated request updated the
-    // session between GET and SET. Reload it and try again.
   }
 
-  throw new ClientError(
-    409,
-    "The funnel session changed during the request. Please retry."
-  );
+  const providedHash = hashAccessToken(accessToken);
+  const storedHash = clean(session.access_token_hash, 128);
+
+  if (!storedHash || !safeEqual(providedHash, storedHash)) {
+    throw new ClientError(
+      401,
+      "Invalid funnel session credentials."
+    );
+  }
+
+  if (
+    session.checkout_completed === true ||
+    session.status === "paid"
+  ) {
+    throw new ClientError(
+      409,
+      "This checkout session has already been completed."
+    );
+  }
+
+  const attribution = sanitizeAttribution(body);
+  const now = new Date();
+  const updatedAt = now.toISOString();
+  const expiresAt = new Date(
+    now.getTime() + SESSION_TTL_SECONDS * 1000
+  ).toISOString();
+
+  const result = await redisCommand([
+    "EVAL",
+    SAVE_CHECKOUT_IDENTITY_SCRIPT,
+    "1",
+    key,
+    checkoutIntentId,
+    providedHash,
+    email,
+    firstName,
+    lastName,
+    JSON.stringify(attribution),
+    updatedAt,
+    expiresAt,
+    String(SESSION_TTL_SECONDS)
+  ]);
+
+  if (result === "COMPLETED") {
+    throw new ClientError(
+      409,
+      "This checkout session has already been completed."
+    );
+  }
+
+  if (
+    result === "MISSING" ||
+    result === "INTENT_MISMATCH" ||
+    result === "TOKEN_MISMATCH"
+  ) {
+    throw new ClientError(
+      401,
+      "Invalid funnel session credentials."
+    );
+  }
+
+  if (result !== "OK") {
+    throw new Error(
+      "Unable to update the secure funnel session."
+    );
+  }
 }
 
 export default async function handler(req, res) {
-  applyResponseHeaders(req, res);
+  const originAllowed = setCors(req, res);
 
-  if (!isRequestOriginAllowed(req)) {
+  if (!originAllowed) {
     return sendJson(res, 403, {
       ok: false,
       error: "Origin is not allowed."
@@ -542,14 +672,7 @@ export default async function handler(req, res) {
   }
 
   if (req.method === "OPTIONS") {
-    res.statusCode = 204;
-    res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-    res.setHeader(
-      "Access-Control-Allow-Headers",
-      "Authorization, Content-Type"
-    );
-    res.setHeader("Access-Control-Max-Age", "600");
-    return res.end();
+    return res.status(204).end();
   }
 
   if (req.method !== "POST") {
@@ -563,12 +686,10 @@ export default async function handler(req, res) {
 
   try {
     const body = parseRequestBody(req);
-    const action = String(body.action || "create")
-      .trim()
-      .toLowerCase();
+    const action = clean(body.action || "create", 50).toLowerCase();
 
     if (action === "create") {
-      const result = await createFunnelSession();
+      const result = await createFunnelSession(req, body);
 
       return sendJson(res, 201, {
         ok: true,
@@ -581,11 +702,12 @@ export default async function handler(req, res) {
 
       return sendJson(res, 200, {
         ok: true,
-        checkout_email_saved: true
+        checkout_email_saved: true,
+        checkout_identity_saved: true
       });
     }
 
-    throw new ClientError(400, "Unsupported funnel-session action.");
+    throw new ClientError(400, "Unsupported action.");
   } catch (error) {
     if (error instanceof ClientError) {
       return sendJson(res, error.statusCode, {
