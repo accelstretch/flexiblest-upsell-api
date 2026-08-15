@@ -26,6 +26,52 @@ const DUPLICATE_CHARGE_AUDIT_TTL_SECONDS =
   30 * 24 * 60 * 60;
 const COMETLY_EVENT_TTL_SECONDS = 30 * 24 * 60 * 60;
 const COMETLY_LOCK_SECONDS = 120;
+const KAJABI_DELIVERY_TTL_SECONDS =
+  400 * 24 * 60 * 60;
+const KAJABI_LOCK_SECONDS = 120;
+
+const KAJABI_PRODUCT_OFFERS = {
+  "133559": {
+    offerKey: "accelstretch",
+    offerId: "2151012544",
+    activationEnv:
+      "KAJABI_ACCELSTRETCH_ACTIVATION_URL",
+    deactivationEnv:
+      "KAJABI_ACCELSTRETCH_DEACTIVATION_URL"
+  },
+  "133565": {
+    offerKey: "routine_quick_sheets",
+    offerId: "2151278593",
+    activationEnv:
+      "KAJABI_ROUTINE_QUICK_SHEETS_ACTIVATION_URL",
+    deactivationEnv:
+      "KAJABI_ROUTINE_QUICK_SHEETS_DEACTIVATION_URL"
+  },
+  "133569": {
+    offerKey: "lean_light",
+    offerId: "2151038529",
+    activationEnv:
+      "KAJABI_LEAN_LIGHT_ACTIVATION_URL",
+    deactivationEnv:
+      "KAJABI_LEAN_LIGHT_DEACTIVATION_URL"
+  },
+  "133573": {
+    offerKey: "advanced_fast_track",
+    offerId: "2150621466",
+    activationEnv:
+      "KAJABI_ADVANCED_FAST_TRACK_ACTIVATION_URL",
+    deactivationEnv:
+      "KAJABI_ADVANCED_FAST_TRACK_DEACTIVATION_URL"
+  },
+  "133574": {
+    offerKey: "fast_track_core",
+    offerId: "2148399198",
+    activationEnv:
+      "KAJABI_FAST_TRACK_CORE_ACTIVATION_URL",
+    deactivationEnv:
+      "KAJABI_FAST_TRACK_CORE_DEACTIVATION_URL"
+  }
+};
 
 const REFERENCE_CHARGE_OFFERS = {
   "133573": {
@@ -209,6 +255,14 @@ function cometlySentKey(idempotencyKey) {
 
 function cometlyLockKey(idempotencyKey) {
   return `paypro:cometly:lock:${idempotencyKey}`;
+}
+
+function kajabiSentKey(idempotencyKey) {
+  return `paypro:kajabi:sent:${idempotencyKey}`;
+}
+
+function kajabiLockKey(idempotencyKey) {
+  return `paypro:kajabi:lock:${idempotencyKey}`;
 }
 
 function isValidSessionIdentifier(value) {
@@ -1477,6 +1531,317 @@ async function releaseLock(lockKey, lockToken) {
   ]);
 }
 
+function isFullItemRefund(data) {
+  const itemTotal = num(data.ORDER_ITEM_TOTAL_AMOUNT);
+  const itemRefunded = num(data.ORDER_ITEM_REFUNDED);
+
+  return (
+    itemTotal > 0 &&
+    itemRefunded + 0.005 >= itemTotal
+  );
+}
+
+function getKajabiAccessAction(data) {
+  const ipnType = pick(
+    data,
+    ["IPN_TYPE_NAME"],
+    200
+  ).toLowerCase();
+
+  if (
+    ipnType === "ordercharged" ||
+    ipnType === "orderchargedbackwon"
+  ) {
+    return "activate";
+  }
+
+  if (
+    ipnType === "orderrefunded" ||
+    ipnType === "orderchargedback"
+  ) {
+    return "deactivate";
+  }
+
+  if (
+    ipnType === "orderpartiallyrefunded" &&
+    isFullItemRefund(data)
+  ) {
+    return "deactivate";
+  }
+
+  return "";
+}
+
+function getKajabiWebhookUrl(offer, action) {
+  const envName = action === "activate"
+    ? offer.activationEnv
+    : offer.deactivationEnv;
+
+  const raw = clean(process.env[envName], 5000);
+
+  if (!raw) {
+    throw new Error(`Missing ${envName}`);
+  }
+
+  let url;
+
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new Error(`Invalid ${envName}`);
+  }
+
+  if (
+    url.protocol !== "https:" ||
+    ![
+      "checkout.kajabi.com",
+      "checkout.newkajabi.com"
+    ].includes(url.hostname.toLowerCase()) ||
+    !url.pathname.includes("/webhooks/offers/")
+  ) {
+    throw new Error(`Untrusted ${envName}`);
+  }
+
+  if (
+    action === "activate" &&
+    offer.offerKey === "accelstretch"
+  ) {
+    url.searchParams.set(
+      "send_offer_grant_email",
+      "true"
+    );
+  }
+
+  return url;
+}
+
+function kajabiResponseAlreadyApplied(status, body) {
+  if (![400, 409, 422].includes(status)) {
+    return false;
+  }
+
+  const message = clean(body, 2000).toLowerCase();
+
+  return [
+    "already been granted",
+    "already granted",
+    "already activated",
+    "already deactivated",
+    "already revoked"
+  ].some((part) => message.includes(part));
+}
+
+async function processKajabiAccess(data) {
+  const productId = pick(data, ["PRODUCT_ID"], 100);
+  const offer = KAJABI_PRODUCT_OFFERS[productId];
+
+  if (!offer) {
+    return {
+      applicable: false,
+      delivered: false
+    };
+  }
+
+  const action = getKajabiAccessAction(data);
+
+  if (!action) {
+    return {
+      applicable: true,
+      delivered: false,
+      skipped: true,
+      reason:
+        pick(data, ["IPN_TYPE_NAME"], 200)
+          .toLowerCase() === "orderpartiallyrefunded"
+          ? "partial_item_refund"
+          : "non_access_ipn"
+    };
+  }
+
+  if (isTestMode(data)) {
+    return {
+      applicable: true,
+      action,
+      delivered: false,
+      skipped: true,
+      reason: "test_mode"
+    };
+  }
+
+  const customer = getCustomer(data);
+
+  if (!validEmail(customer.email)) {
+    throw new Error(
+      "Kajabi fulfillment requires a valid customer email"
+    );
+  }
+
+  const fullName =
+    customer.fullName ||
+    clean(
+      `${customer.firstName} ${customer.lastName}`,
+      220
+    ) ||
+    "Customer";
+
+  const orderId = pick(data, ["ORDER_ID"], 200);
+  const orderItemId =
+    pick(data, ["ORDER_ITEM_ID"], 200) ||
+    productId;
+  const ipnType = pick(
+    data,
+    ["IPN_TYPE_NAME"],
+    200
+  ).toLowerCase();
+
+  if (!/^\d+$/.test(orderId)) {
+    throw new Error(
+      "Kajabi fulfillment requires a valid PayPro order ID"
+    );
+  }
+
+  const idempotencyKey = [
+    orderId,
+    orderItemId,
+    offer.offerKey,
+    ipnType
+  ].join(":");
+
+  const sentKey = kajabiSentKey(idempotencyKey);
+  const existing = parseStoredRecord(
+    await redisCommand(["GET", sentKey])
+  );
+
+  if (existing?.delivered === true) {
+    return {
+      applicable: true,
+      action,
+      delivered: true,
+      alreadyDelivered: true,
+      offerId: offer.offerId
+    };
+  }
+
+  const lockKey = kajabiLockKey(idempotencyKey);
+  const lockToken = createHash("sha256")
+    .update(
+      `${idempotencyKey}:${Date.now()}:${Math.random()}`,
+      "utf8"
+    )
+    .digest("hex");
+
+  const lockResult = await redisCommand([
+    "SET",
+    lockKey,
+    lockToken,
+    "NX",
+    "EX",
+    String(KAJABI_LOCK_SECONDS)
+  ]);
+
+  if (lockResult !== "OK") {
+    return {
+      applicable: true,
+      action,
+      delivered: false,
+      processing: true,
+      offerId: offer.offerId
+    };
+  }
+
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(
+      () => controller.abort(),
+      10000
+    );
+
+    let response;
+    let responseText = "";
+
+    try {
+      response = await fetch(
+        getKajabiWebhookUrl(offer, action),
+        {
+          method: "POST",
+          headers: {
+            Accept: "application/json",
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            name: fullName,
+            email: customer.email,
+            external_user_id: customer.email
+          }),
+          signal: controller.signal
+        }
+      );
+
+      responseText = await response.text();
+    } finally {
+      clearTimeout(timeoutId);
+    }
+
+    if (
+      !response.ok &&
+      !kajabiResponseAlreadyApplied(
+        response.status,
+        responseText
+      )
+    ) {
+      console.error("KAJABI WEBHOOK REJECTED", {
+        status: response.status,
+        action,
+        offer_id: offer.offerId,
+        order_id: orderId,
+        order_item_id: orderItemId
+      });
+
+      throw new Error(
+        `Kajabi rejected ${action} with HTTP ${response.status}`
+      );
+    }
+
+    await redisCommand([
+      "SET",
+      sentKey,
+      JSON.stringify({
+        delivered: true,
+        action,
+        offer_id: offer.offerId,
+        order_id: orderId,
+        order_item_id: orderItemId,
+        ipn_type: ipnType,
+        delivered_at: new Date().toISOString()
+      }),
+      "EX",
+      String(KAJABI_DELIVERY_TTL_SECONDS)
+    ]);
+
+    await releaseLock(lockKey, lockToken);
+
+    console.log("KAJABI ACCESS UPDATED", {
+      action,
+      offer_id: offer.offerId,
+      order_id: orderId,
+      order_item_id: orderItemId
+    });
+
+    return {
+      applicable: true,
+      action,
+      delivered: true,
+      alreadyDelivered: false,
+      offerId: offer.offerId
+    };
+  } catch (error) {
+    try {
+      await releaseLock(lockKey, lockToken);
+    } catch {}
+
+    throw error;
+  }
+}
+
 async function sendCometlyEvent(event) {
   const apiKey = clean(
     process.env.COMETLY_API_KEY,
@@ -1675,6 +2040,8 @@ export default async function handler(req, res) {
       });
     }
 
+    const kajabiAccess = await processKajabiAccess(data);
+
     const status = pick(
       data,
       ["ORDER_STATUS"],
@@ -1690,12 +2057,21 @@ export default async function handler(req, res) {
     if (status && status !== "processed") {
       return sendSkipped(
         res,
-        "non_processed_order"
+        "non_processed_order",
+        {
+          kajabi_access_updated:
+            kajabiAccess.delivered === true,
+          kajabi_action: kajabiAccess.action || ""
+        }
       );
     }
 
     if (ipnType && ipnType !== "ordercharged") {
-      return sendSkipped(res, "non_charge_ipn");
+      return sendSkipped(res, "non_charge_ipn", {
+        kajabi_access_updated:
+          kajabiAccess.delivered === true,
+        kajabi_action: kajabiAccess.action || ""
+      });
     }
 
     const orderId = pick(data, ["ORDER_ID"], 200);
@@ -1707,7 +2083,11 @@ export default async function handler(req, res) {
         "checkout_bump_item_ipn",
         {
           order_id: orderId,
-          product_id: productId
+          product_id: productId,
+          kajabi_access_updated:
+            kajabiAccess.delivered === true,
+          kajabi_already_updated:
+            kajabiAccess.alreadyDelivered === true
         }
       );
     }
@@ -1794,6 +2174,9 @@ export default async function handler(req, res) {
         charge_recovery_saved:
           testChargeRecovery?.saved === true,
         secure_session_verified: true,
+        kajabi_access_updated: false,
+        kajabi_test_skipped:
+          kajabiAccess.reason === "test_mode",
         sent_to_cometly: false
       });
     }
@@ -1823,6 +2206,8 @@ export default async function handler(req, res) {
           ok: true,
           duplicate_charge_detected: true,
           secure_session_verified: true,
+          kajabi_access_updated:
+            kajabiAccess.delivered === true,
           sent_to_cometly: false,
           order_id: orderId
         });
@@ -1873,6 +2258,8 @@ export default async function handler(req, res) {
         sent_to_cometly: false,
         processing: true,
         secure_session_verified: true,
+        kajabi_access_updated:
+          kajabiAccess.delivered === true,
         event_name: event.event_name,
         order_id: event.order_id
       });
@@ -1882,6 +2269,10 @@ export default async function handler(req, res) {
       ok: true,
       mapping_saved: eventKind === "main",
       secure_session_verified: true,
+      kajabi_access_updated:
+        kajabiAccess.delivered === true,
+      kajabi_already_updated:
+        kajabiAccess.alreadyDelivered === true,
       charge_recovery_saved:
         chargeRecovery?.saved === true,
       sent_to_cometly: delivery.sent,
