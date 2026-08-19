@@ -1,34 +1,21 @@
 import crypto from "crypto";
 
-const BONUS_RESERVATION_SECONDS = 2 * 60 * 60 + 58 * 60;
-const RECORD_TTL_SECONDS = 24 * 60 * 60;
-const MAX_REQUEST_BODY_BYTES = 8 * 1024;
-
-class ClientError extends Error {
-  constructor(statusCode, message) {
-    super(message);
-    this.name = "ClientError";
-    this.statusCode = statusCode;
-  }
-}
+const BONUS_RESERVATION_SECONDS = 24 * 60 * 60;
+const RECORD_TTL_SECONDS = 30 * 24 * 60 * 60;
 
 function clean(value) {
   return String(value || "").trim();
 }
 
-function isPlainObject(value) {
-  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+function reservationKey(reservationId) {
+  return `bonus:reservation:${reservationId}`;
 }
 
-function validReservationId(value) {
-  return /^br_[a-f0-9]{32}$/.test(clean(value));
+function createReservationId() {
+  return `br_${crypto.randomBytes(16).toString("hex")}`;
 }
 
-function makeReservationId() {
-  return `br_${crypto.randomUUID().replace(/-/g, "")}`;
-}
-
-function makeAccessToken() {
+function createAccessToken() {
   return crypto.randomBytes(32).toString("base64url");
 }
 
@@ -52,50 +39,52 @@ function safeEqual(left, right) {
 function getBearerToken(req) {
   const authorization = String(req.headers.authorization || "");
   const match = authorization.match(/^Bearer\s+(.+)$/i);
+
   return match ? match[1].trim() : "";
 }
 
-function reservationKey(reservationId) {
-  return `bonus:reservation:${reservationId}`;
+function isValidReservationId(value) {
+  return /^br_[a-f0-9]{32}$/.test(clean(value));
 }
 
 function getAllowedOrigins() {
-  const configured = [
-    process.env.APP_BASE_URL,
-    process.env.ALLOWED_ORIGINS,
-    process.env.WEBFLOW_ALLOWED_ORIGINS
-  ]
-    .filter(Boolean)
-    .flatMap(function (value) {
-      return String(value).split(",");
-    })
-    .map(clean)
-    .filter(Boolean);
-
-  return new Set([
+  const origins = new Set([
     "https://flexiblest.com",
-    "https://www.flexiblest.com",
-    ...configured
+    "https://www.flexiblest.com"
   ]);
+
+  clean(process.env.APP_BASE_URL)
+    .split(",")
+    .map(clean)
+    .filter(Boolean)
+    .forEach(function (origin) {
+      origins.add(origin.replace(/\/+$/, ""));
+    });
+
+  clean(process.env.ALLOWED_ORIGINS)
+    .split(",")
+    .map(clean)
+    .filter(Boolean)
+    .forEach(function (origin) {
+      origins.add(origin.replace(/\/+$/, ""));
+    });
+
+  return origins;
 }
 
 function setCors(req, res) {
-  const origin = clean(req.headers.origin);
+  const origin = clean(req.headers.origin).replace(/\/+$/, "");
+  const allowedOrigins = getAllowedOrigins();
 
-  if (!origin) {
-    return;
+  if (origin && allowedOrigins.has(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
   }
 
-  if (!getAllowedOrigins().has(origin)) {
-    throw new ClientError(403, "Origin is not allowed.");
-  }
-
-  res.setHeader("Access-Control-Allow-Origin", origin);
-  res.setHeader("Vary", "Origin");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader(
     "Access-Control-Allow-Headers",
-    "Authorization, Content-Type"
+    "Content-Type, Authorization"
   );
   res.setHeader("Access-Control-Max-Age", "86400");
 }
@@ -104,130 +93,94 @@ function sendJson(res, statusCode, payload) {
   res.statusCode = statusCode;
   res.setHeader("Content-Type", "application/json; charset=utf-8");
   res.setHeader("Cache-Control", "no-store, max-age=0");
-  res.setHeader("Pragma", "no-cache");
   res.end(JSON.stringify(payload));
 }
 
 async function readRequestBody(req) {
-  if (isPlainObject(req.body)) {
-    const serialized = JSON.stringify(req.body);
-
-    if (Buffer.byteLength(serialized, "utf8") > MAX_REQUEST_BODY_BYTES) {
-      throw new ClientError(413, "Request body is too large.");
-    }
-
+  if (
+    req.body &&
+    typeof req.body === "object" &&
+    !Buffer.isBuffer(req.body)
+  ) {
     return req.body;
   }
 
-  if (typeof req.body === "string" || Buffer.isBuffer(req.body)) {
-    const rawBody = Buffer.isBuffer(req.body)
-      ? req.body.toString("utf8")
-      : req.body;
-
-    if (Buffer.byteLength(rawBody, "utf8") > MAX_REQUEST_BODY_BYTES) {
-      throw new ClientError(413, "Request body is too large.");
-    }
-
+  if (typeof req.body === "string") {
     try {
-      const parsed = JSON.parse(rawBody || "{}");
-
-      if (!isPlainObject(parsed)) {
-        throw new Error("Invalid JSON object.");
-      }
-
-      return parsed;
+      return JSON.parse(req.body);
     } catch (error) {
-      throw new ClientError(400, "Request body must be valid JSON.");
+      return {};
     }
   }
 
   const chunks = [];
-  let totalBytes = 0;
 
   for await (const chunk of req) {
-    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-    totalBytes += buffer.length;
-
-    if (totalBytes > MAX_REQUEST_BODY_BYTES) {
-      throw new ClientError(413, "Request body is too large.");
-    }
-
-    chunks.push(buffer);
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
   }
 
-  const rawBody = Buffer.concat(chunks).toString("utf8");
+  if (!chunks.length) {
+    return {};
+  }
 
   try {
-    const parsed = JSON.parse(rawBody || "{}");
-
-    if (!isPlainObject(parsed)) {
-      throw new Error("Invalid JSON object.");
-    }
-
-    return parsed;
+    return JSON.parse(Buffer.concat(chunks).toString("utf8"));
   } catch (error) {
-    throw new ClientError(400, "Request body must be valid JSON.");
+    return {};
   }
 }
 
-async function redisCommand(args) {
-  const redisUrl = clean(process.env.KV_REST_API_URL).replace(/\/$/, "");
-  const redisToken = clean(process.env.KV_REST_API_TOKEN);
+function getRedisConfiguration() {
+  const url = clean(process.env.KV_REST_API_URL).replace(/\/+$/, "");
+  const token = clean(process.env.KV_REST_API_TOKEN);
 
-  if (!redisUrl || !redisToken) {
-    throw new Error("Redis environment variables are missing.");
+  if (!url || !token) {
+    throw new Error("Redis environment variables are not configured.");
   }
 
-  const controller = new AbortController();
-  const timeout = setTimeout(function () {
-    controller.abort();
-  }, 8000);
-
-  try {
-    const commandUrl =
-      redisUrl +
-      "/" +
-      args.map(function (value) {
-        return encodeURIComponent(String(value));
-      }).join("/");
-
-    const response = await fetch(commandUrl, {
-      method: "GET",
-      headers: {
-        Authorization: `Bearer ${redisToken}`
-      },
-      cache: "no-store",
-      signal: controller.signal
-    });
-
-    const data = await response.json().catch(function () {
-      return {};
-    });
-
-    if (!response.ok || data.error) {
-      throw new Error(
-        `Redis command failed: ${clean(data.error) || response.status}`
-      );
-    }
-
-    return data.result;
-  } finally {
-    clearTimeout(timeout);
-  }
+  return { url, token };
 }
 
-async function readReservation(reservationId) {
-  const result = await redisCommand(["GET", reservationKey(reservationId)]);
+async function redisCommand(command) {
+  const configuration = getRedisConfiguration();
+
+  const response = await fetch(configuration.url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${configuration.token}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(command)
+  });
+
+  const payload = await response.json().catch(function () {
+    return {};
+  });
+
+  if (!response.ok || payload.error) {
+    throw new Error(
+      clean(payload.error) || `Redis request failed with ${response.status}.`
+    );
+  }
+
+  return payload.result;
+}
+
+async function readReservationRecord(key) {
+  const result = await redisCommand(["GET", key]);
 
   if (!result) {
     return null;
   }
 
+  if (typeof result === "object") {
+    return result;
+  }
+
   try {
-    const parsed = typeof result === "string" ? JSON.parse(result) : result;
-    return isPlainObject(parsed) ? parsed : null;
+    return JSON.parse(result);
   } catch (error) {
-    throw new Error("Stored bonus reservation is invalid.");
+    return null;
   }
 }
 
@@ -237,50 +190,134 @@ async function createReservationRecord(key, record) {
     key,
     JSON.stringify(record),
     "EX",
-    RECORD_TTL_SECONDS,
+    String(RECORD_TTL_SECONDS),
     "NX"
   ]);
 
   return result === "OK";
 }
 
-function getReservationState(record, nowMs) {
-  const deadlineMs = Date.parse(clean(record.deadline_at));
+async function writeReservationRecord(key, record) {
+  const result = await redisCommand([
+    "SET",
+    key,
+    JSON.stringify(record),
+    "EX",
+    String(RECORD_TTL_SECONDS)
+  ]);
 
-  if (!Number.isFinite(deadlineMs)) {
-    throw new Error("Stored bonus reservation deadline is invalid.");
+  if (result !== "OK") {
+    throw new Error("Unable to save the bonus reservation.");
+  }
+}
+
+async function refreshReservationTtl(key) {
+  await redisCommand([
+    "EXPIRE",
+    key,
+    String(RECORD_TTL_SECONDS)
+  ]);
+}
+
+function getReservationState(record, nowMilliseconds) {
+  const deadlineMilliseconds = Date.parse(record.deadline_at || "");
+
+  if (!Number.isFinite(deadlineMilliseconds)) {
+    return {
+      status: "expired",
+      remaining_seconds: 0
+    };
   }
 
-  const bonusEligible = nowMs < deadlineMs;
+  const remainingSeconds = Math.max(
+    0,
+    Math.ceil((deadlineMilliseconds - nowMilliseconds) / 1000)
+  );
 
   return {
-    status: bonusEligible ? "active" : "expired",
-    bonus_eligible: bonusEligible,
-    remaining_seconds: bonusEligible
-      ? Math.max(0, Math.ceil((deadlineMs - nowMs) / 1000))
-      : 0
+    status: remainingSeconds > 0 ? "active" : "expired",
+    remaining_seconds: remainingSeconds
   };
 }
 
-async function createBonusReservation() {
-  const nowMs = Date.now();
-  const createdAt = new Date(nowMs).toISOString();
-  const deadlineAt = new Date(
-    nowMs + BONUS_RESERVATION_SECONDS * 1000
-  ).toISOString();
+function buildReservationPayload(record, options) {
+  const now = options.now;
+  const state = getReservationState(record, now.getTime());
 
-  for (let attempt = 0; attempt < 4; attempt += 1) {
-    const reservationId = makeReservationId();
-    const accessToken = makeAccessToken();
+  return {
+    ok: true,
+    reservation_id: record.reservation_id,
+    status: state.status,
+    remaining_seconds: state.remaining_seconds,
+    duration_seconds: BONUS_RESERVATION_SECONDS,
+    deadline_at: record.deadline_at,
+    cycle_started_at: record.cycle_started_at,
+    cycle_number: Number(record.cycle_number || 1),
+    server_time: now.toISOString(),
+    renewed: options.renewed === true
+  };
+}
+
+async function authorizeReservation(req, body) {
+  const reservationId = clean(body.reservation_id);
+  const accessToken = getBearerToken(req);
+
+  if (!isValidReservationId(reservationId) || !accessToken) {
+    return {
+      ok: false,
+      statusCode: 401,
+      error: "A valid reservation ID and access token are required."
+    };
+  }
+
+  const key = reservationKey(reservationId);
+  const record = await readReservationRecord(key);
+
+  if (!record || !record.access_token_hash) {
+    return {
+      ok: false,
+      statusCode: 404,
+      error: "The bonus reservation was not found."
+    };
+  }
+
+  const suppliedHash = hashAccessToken(accessToken);
+
+  if (!safeEqual(suppliedHash, record.access_token_hash)) {
+    return {
+      ok: false,
+      statusCode: 401,
+      error: "The bonus reservation access token is invalid."
+    };
+  }
+
+  return {
+    ok: true,
+    key,
+    record
+  };
+}
+
+async function createReservation() {
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const reservationId = createReservationId();
+    const accessToken = createAccessToken();
+    const now = new Date();
+
+    const deadlineAt = new Date(
+      now.getTime() + BONUS_RESERVATION_SECONDS * 1000
+    ).toISOString();
 
     const record = {
-      version: 1,
-      bonus_reservation_id: reservationId,
+      version: 2,
+      reservation_id: reservationId,
       access_token_hash: hashAccessToken(accessToken),
-      created_at: createdAt,
-      deadline_at: deadlineAt,
       status: "active",
-      updated_at: createdAt
+      cycle_number: 1,
+      cycle_started_at: now.toISOString(),
+      deadline_at: deadlineAt,
+      created_at: now.toISOString(),
+      updated_at: now.toISOString()
     };
 
     const created = await createReservationRecord(
@@ -290,110 +327,159 @@ async function createBonusReservation() {
 
     if (created) {
       return {
-        bonus_reservation_id: reservationId,
-        bonus_reservation_access_token: accessToken,
-        created_at: createdAt,
-        deadline_at: deadlineAt,
-        duration_seconds: BONUS_RESERVATION_SECONDS,
-        server_time: createdAt,
-        status: "active",
-        bonus_eligible: true,
-        remaining_seconds: BONUS_RESERVATION_SECONDS
+        ...buildReservationPayload(record, {
+          now,
+          renewed: false
+        }),
+        access_token: accessToken
       };
     }
   }
 
-  throw new Error("Unable to allocate a unique bonus reservation.");
+  throw new Error("Unable to create a unique bonus reservation.");
 }
 
-async function getBonusReservationStatus(req, body) {
-  const reservationId = clean(body.bonus_reservation_id);
-  const accessToken = getBearerToken(req);
+async function getReservationStatus(req, body) {
+  const authorization = await authorizeReservation(req, body);
 
-  if (!validReservationId(reservationId) || !accessToken) {
-    throw new ClientError(401, "Invalid reservation credentials.");
+  if (!authorization.ok) {
+    return authorization;
   }
 
-  const record = await readReservation(reservationId);
+  const now = new Date();
 
-  if (
-    !record ||
-    !safeEqual(hashAccessToken(accessToken), record.access_token_hash)
-  ) {
-    throw new ClientError(401, "Invalid reservation credentials.");
-  }
-
-  const nowMs = Date.now();
-  const serverTime = new Date(nowMs).toISOString();
-  const state = getReservationState(record, nowMs);
+  await refreshReservationTtl(authorization.key);
 
   return {
-    bonus_reservation_id: reservationId,
-    created_at: clean(record.created_at),
-    deadline_at: clean(record.deadline_at),
-    duration_seconds: BONUS_RESERVATION_SECONDS,
-    server_time: serverTime,
-    ...state
+    ok: true,
+    statusCode: 200,
+    payload: buildReservationPayload(authorization.record, {
+      now,
+      renewed: false
+    })
+  };
+}
+
+async function renewReservation(req, body) {
+  const authorization = await authorizeReservation(req, body);
+
+  if (!authorization.ok) {
+    return authorization;
+  }
+
+  const now = new Date();
+  const currentState = getReservationState(
+    authorization.record,
+    now.getTime()
+  );
+
+  if (currentState.status === "active") {
+    await refreshReservationTtl(authorization.key);
+
+    return {
+      ok: true,
+      statusCode: 200,
+      payload: buildReservationPayload(authorization.record, {
+        now,
+        renewed: false
+      })
+    };
+  }
+
+  const updatedRecord = {
+    ...authorization.record,
+    version: 2,
+    status: "active",
+    cycle_number: Number(authorization.record.cycle_number || 1) + 1,
+    cycle_started_at: now.toISOString(),
+    deadline_at: new Date(
+      now.getTime() + BONUS_RESERVATION_SECONDS * 1000
+    ).toISOString(),
+    updated_at: now.toISOString()
+  };
+
+  await writeReservationRecord(authorization.key, updatedRecord);
+
+  return {
+    ok: true,
+    statusCode: 200,
+    payload: buildReservationPayload(updatedRecord, {
+      now,
+      renewed: true
+    })
   };
 }
 
 export default async function handler(req, res) {
+  setCors(req, res);
+
+  if (req.method === "OPTIONS") {
+    res.statusCode = 204;
+    res.end();
+    return;
+  }
+
+  if (req.method !== "POST") {
+    sendJson(res, 405, {
+      ok: false,
+      error: "Method not allowed."
+    });
+    return;
+  }
+
   try {
-    setCors(req, res);
-
-    if (req.method === "OPTIONS") {
-      res.statusCode = 204;
-      res.setHeader("Cache-Control", "no-store, max-age=0");
-      res.end();
-      return;
-    }
-
-    if (req.method !== "POST") {
-      res.setHeader("Allow", "POST, OPTIONS");
-      return sendJson(res, 405, {
-        ok: false,
-        error: "Method not allowed."
-      });
-    }
-
     const body = await readRequestBody(req);
     const action = clean(body.action).toLowerCase();
 
     if (action === "create") {
-      const reservation = await createBonusReservation();
-
-      return sendJson(res, 201, {
-        ok: true,
-        ...reservation
-      });
+      const result = await createReservation();
+      sendJson(res, 201, result);
+      return;
     }
 
     if (action === "status") {
-      const reservation = await getBonusReservationStatus(req, body);
+      const result = await getReservationStatus(req, body);
 
-      return sendJson(res, 200, {
-        ok: true,
-        ...reservation
-      });
+      if (!result.ok) {
+        sendJson(res, result.statusCode, {
+          ok: false,
+          error: result.error
+        });
+        return;
+      }
+
+      sendJson(res, result.statusCode, result.payload);
+      return;
     }
 
-    throw new ClientError(400, "Unsupported action.");
+    if (action === "renew") {
+      const result = await renewReservation(req, body);
+
+      if (!result.ok) {
+        sendJson(res, result.statusCode, {
+          ok: false,
+          error: result.error
+        });
+        return;
+      }
+
+      sendJson(res, result.statusCode, result.payload);
+      return;
+    }
+
+    sendJson(res, 400, {
+      ok: false,
+      error: "Unsupported action."
+    });
   } catch (error) {
-    if (error instanceof ClientError) {
-      return sendJson(res, error.statusCode, {
-        ok: false,
-        error: error.message
-      });
-    }
-
     console.error(
       "BONUS RESERVATION ERROR",
       error instanceof Error ? error.message : "Unknown error"
     );
 
-    return sendJson(res, 500, {
+    sendJson(res, 500, {
       ok: false,
-      error: "Unable to process the bonus reservation request."
+      error: "Unable to process the bonus reservation."
     });
   }
 }
