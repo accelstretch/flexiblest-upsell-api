@@ -2,6 +2,7 @@ import crypto from "crypto";
 
 const BONUS_RESERVATION_SECONDS = 24 * 60 * 60;
 const RECORD_TTL_SECONDS = 30 * 24 * 60 * 60;
+const LEGACY_COOKIE_NAME = "fs_bonus_reservation";
 
 function clean(value) {
   return String(value || "").trim();
@@ -43,6 +44,64 @@ function getBearerToken(req) {
   return match ? match[1].trim() : "";
 }
 
+function getCookie(req, name) {
+  const cookies = String(req.headers.cookie || "").split(";");
+
+  for (const cookie of cookies) {
+    const separatorIndex = cookie.indexOf("=");
+
+    if (separatorIndex < 0) {
+      continue;
+    }
+
+    const cookieName = cookie.slice(0, separatorIndex).trim();
+
+    if (cookieName !== name) {
+      continue;
+    }
+
+    try {
+      return decodeURIComponent(cookie.slice(separatorIndex + 1).trim());
+    } catch (error) {
+      return "";
+    }
+  }
+
+  return "";
+}
+
+function getLegacyCredentials(req) {
+  const value = getCookie(req, LEGACY_COOKIE_NAME);
+  const separatorIndex = value.indexOf(".");
+
+  if (separatorIndex < 0) {
+    return { reservationId: "", accessToken: "" };
+  }
+
+  return {
+    reservationId: value.slice(0, separatorIndex),
+    accessToken: value.slice(separatorIndex + 1)
+  };
+}
+
+function withBearerToken(req, accessToken) {
+  return {
+    headers: {
+      ...(req.headers || {}),
+      authorization: `Bearer ${accessToken}`
+    }
+  };
+}
+
+function setLegacyCookie(res, reservationId, accessToken) {
+  const value = encodeURIComponent(`${reservationId}.${accessToken}`);
+
+  res.setHeader(
+    "Set-Cookie",
+    `${LEGACY_COOKIE_NAME}=${value}; Path=/; Max-Age=${RECORD_TTL_SECONDS}; HttpOnly; Secure; SameSite=Lax`
+  );
+}
+
 function isValidReservationId(value) {
   return /^br_[a-f0-9]{32}$/.test(clean(value));
 }
@@ -81,7 +140,8 @@ function setCors(req, res) {
     res.setHeader("Vary", "Origin");
   }
 
-  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Credentials", "true");
   res.setHeader(
     "Access-Control-Allow-Headers",
     "Content-Type, Authorization"
@@ -243,6 +303,7 @@ function getReservationState(record, nowMilliseconds) {
 function buildReservationPayload(record, options) {
   const now = options.now;
   const state = getReservationState(record, now.getTime());
+  const deadlineMilliseconds = Date.parse(record.deadline_at || "");
 
   return {
     ok: true,
@@ -251,6 +312,12 @@ function buildReservationPayload(record, options) {
     remaining_seconds: state.remaining_seconds,
     duration_seconds: BONUS_RESERVATION_SECONDS,
     deadline_at: record.deadline_at,
+    expires_at: Number.isFinite(deadlineMilliseconds)
+      ? deadlineMilliseconds
+      : null,
+    expires_at_ms: Number.isFinite(deadlineMilliseconds)
+      ? deadlineMilliseconds
+      : null,
     cycle_started_at: record.cycle_started_at,
     cycle_number: Number(record.cycle_number || 1),
     server_time: now.toISOString(),
@@ -410,6 +477,43 @@ async function renewReservation(req, body) {
   };
 }
 
+async function getLegacyReservation(req, res) {
+  const credentials = getLegacyCredentials(req);
+
+  if (
+    isValidReservationId(credentials.reservationId) &&
+    credentials.accessToken
+  ) {
+    const result = await renewReservation(
+      withBearerToken(req, credentials.accessToken),
+      { reservation_id: credentials.reservationId }
+    );
+
+    if (result.ok) {
+      setLegacyCookie(
+        res,
+        credentials.reservationId,
+        credentials.accessToken
+      );
+
+      return {
+        statusCode: 200,
+        payload: result.payload
+      };
+    }
+  }
+
+  const created = await createReservation();
+  const { access_token: accessToken, ...payload } = created;
+
+  setLegacyCookie(res, created.reservation_id, accessToken);
+
+  return {
+    statusCode: 200,
+    payload
+  };
+}
+
 export default async function handler(req, res) {
   setCors(req, res);
 
@@ -419,7 +523,7 @@ export default async function handler(req, res) {
     return;
   }
 
-  if (req.method !== "POST") {
+  if (req.method !== "GET" && req.method !== "POST") {
     sendJson(res, 405, {
       ok: false,
       error: "Method not allowed."
@@ -428,6 +532,12 @@ export default async function handler(req, res) {
   }
 
   try {
+    if (req.method === "GET") {
+      const result = await getLegacyReservation(req, res);
+      sendJson(res, result.statusCode, result.payload);
+      return;
+    }
+
     const body = await readRequestBody(req);
     const action = clean(body.action).toLowerCase();
 
@@ -453,7 +563,29 @@ export default async function handler(req, res) {
     }
 
     if (action === "renew") {
-      const result = await renewReservation(req, body);
+      let actionRequest = req;
+      let actionBody = body;
+
+      if (!clean(body.reservation_id) || !getBearerToken(req)) {
+        const credentials = getLegacyCredentials(req);
+
+        if (
+          isValidReservationId(credentials.reservationId) &&
+          credentials.accessToken
+        ) {
+          actionRequest = withBearerToken(req, credentials.accessToken);
+          actionBody = {
+            ...body,
+            reservation_id: credentials.reservationId
+          };
+        } else {
+          const legacyResult = await getLegacyReservation(req, res);
+          sendJson(res, legacyResult.statusCode, legacyResult.payload);
+          return;
+        }
+      }
+
+      const result = await renewReservation(actionRequest, actionBody);
 
       if (!result.ok) {
         sendJson(res, result.statusCode, {
@@ -461,6 +593,19 @@ export default async function handler(req, res) {
           error: result.error
         });
         return;
+      }
+
+      const legacyCredentials = getLegacyCredentials(req);
+
+      if (
+        isValidReservationId(legacyCredentials.reservationId) &&
+        legacyCredentials.accessToken
+      ) {
+        setLegacyCookie(
+          res,
+          legacyCredentials.reservationId,
+          legacyCredentials.accessToken
+        );
       }
 
       sendJson(res, result.statusCode, result.payload);
