@@ -1386,6 +1386,31 @@ function buildCometlyEvent(data, req, session, kind) {
     ["utm_term"]
   );
 
+  /*
+   * Cometly's Meta attribution fields are distinct from the generic UTM
+   * fields. Prefer the canonical comet_* values captured by the funnel, then
+   * accept the legacy aliases that PayPro receives as x-* metadata.
+   */
+  const cometSource =
+    getAttributionValue(
+      session,
+      data,
+      ["comet_source", "site_source_name"]
+    ) || utmSource;
+
+  const cometAdId =
+    getAttributionValue(
+      session,
+      data,
+      ["comet_ad_id", "ad_id"]
+    ) || fbclid;
+
+  const cometPlacement = getAttributionValue(
+    session,
+    data,
+    ["comet_placement", "placement"]
+  );
+
   const requestContext = isPlainObject(
     session.request_context
   )
@@ -1467,11 +1492,12 @@ function buildCometlyEvent(data, req, session, kind) {
     upsell_common_id: rootOrderId || orderId,
     idempotency_key: idempotencyKey,
 
-    comet_source: utmSource,
-    comet_network: utmSource,
+    comet_source: cometSource,
+    comet_network: cometSource,
     comet_campaign: utmCampaign,
     comet_ad_group: utmContent,
-    comet_ad_id: fbclid,
+    comet_ad_id: cometAdId,
+    comet_placement: cometPlacement,
     comet_keyword: utmTerm,
     comet_type: utmMedium,
 

@@ -358,6 +358,18 @@ function sanitizeAttribution(body) {
       300
     ),
     adset_id: clean(valueFor("adset_id"), 300),
+    comet_source: clean(
+      valueFor("comet_source", "site_source_name", "utm_source"),
+      300
+    ),
+    comet_ad_id: clean(
+      valueFor("comet_ad_id", "ad_id"),
+      300
+    ),
+    comet_placement: clean(
+      valueFor("comet_placement", "placement"),
+      300
+    ),
     ad_id: clean(valueFor("ad_id"), 300),
     placement: clean(valueFor("placement"), 300),
     site_source_name: clean(valueFor("site_source_name"), 100),
