@@ -1,12 +1,239 @@
-const SCRIPT = `(()=>{if(!['/accelstretch','/secure-checkout'].includes(location.pathname))return;const A='https://api.flexiblest.io/api/web-vitals',q=new URLSearchParams(location.search),st=(()=>{try{return JSON.parse(localStorage.getItem('fs_attribution_data')||'{}')}catch(e){return{}}})(),u=navigator.userAgent||'',r=(q.get('utm_source')||q.get('site_source_name')||q.get('comet_source')||st.utm_source||st.site_source_name||st.comet_source||document.referrer||'').toLowerCase(),src=/instagram/.test(r+u)?'instagram':/facebook|fbav|fban/.test(r+u)?'facebook':/meta/.test(r)?'meta':r?'other':'direct',d=innerWidth<768?'mobile':innerWidth<992?'tablet':'desktop',n=performance.getEntriesByType('navigation')[0],send=(m,v)=>{if(v==null||!isFinite(v))return;let b=JSON.stringify({metric:m,value:v,path:location.pathname,device:d,source:src,inApp:/FBAN|FBAV|Instagram/i.test(u),navigationType:n?.type||'',viewportWidth:innerWidth});try{if(navigator.sendBeacon&&navigator.sendBeacon(A,new Blob([b],{type:'text/plain'})))return}catch(e){}fetch(A,{method:'POST',headers:{'Content-Type':'text/plain'},body:b,keepalive:true}).catch(()=>{})};let l=0,c=0,i=0,z=0;try{new PerformanceObserver(x=>{let e=x.getEntries().at(-1);if(e)l=e.startTime}).observe({type:'largest-contentful-paint',buffered:true})}catch(e){}try{new PerformanceObserver(x=>x.getEntries().forEach(e=>{if(!e.hadRecentInput)c+=e.value})).observe({type:'layout-shift',buffered:true})}catch(e){}try{new PerformanceObserver(x=>x.getEntries().forEach(e=>{if(e.interactionId)i=Math.max(i,e.duration)})).observe({type:'event',buffered:true,durationThreshold:40})}catch(e){}try{new PerformanceObserver(x=>x.getEntries().forEach(e=>{if(e.name==='first-contentful-paint')send('FCP',e.startTime)})).observe({type:'paint',buffered:true})}catch(e){}if(n)send('TTFB',n.responseStart);const f=()=>{if(z)return;z=1;if(l)send('LCP',l);send('CLS',c);if(i)send('INP',i)};addEventListener('pagehide',f);addEventListener('visibilitychange',()=>{if(document.visibilityState==='hidden')f()});if(location.pathname==='/secure-checkout'){let a=0,b=0;const g=()=>{if(!document.querySelector('.fsu-paypro-frame.is-ready'))return;if(!a){a=1;send('IFRAME',performance.now())}if(b){send('BUMP',performance.now()-b);b=0}};new MutationObserver(g).observe(document.documentElement,{subtree:true,childList:true,attributes:true,attributeFilter:['class']});addEventListener('click',e=>{if(e.target.closest('.bump-top-bar'))b=performance.now()},true);g()}})();`;
+const SCRIPT = `(() => {
+  "use strict";
+
+  const PATHS = new Set(["/accelstretch", "/secure-checkout"]);
+  if (!PATHS.has(location.pathname)) return;
+
+  const ENDPOINT = "https://api.flexiblest.io/api/web-vitals";
+  const LIBRARY = "https://unpkg.com/web-vitals@6.2.0/dist/web-vitals.iife.js";
+  const SAMPLE_KEY = "fs_rum_sample_v2";
+  const params = new URLSearchParams(location.search);
+
+  let storedAttribution = {};
+  try {
+    storedAttribution = JSON.parse(localStorage.getItem("fs_attribution_data") || "{}") || {};
+  } catch (_) {}
+
+  const userAgent = navigator.userAgent || "";
+  const sourceText = (
+    params.get("utm_source") ||
+    params.get("site_source_name") ||
+    params.get("comet_source") ||
+    storedAttribution.utm_source ||
+    storedAttribution.site_source_name ||
+    storedAttribution.comet_source ||
+    document.referrer ||
+    ""
+  ).toLowerCase();
+
+  const source = /instagram/.test(sourceText + " " + userAgent)
+    ? "instagram"
+    : /facebook|fbav|fban/.test(sourceText + " " + userAgent)
+      ? "facebook"
+      : /meta/.test(sourceText)
+        ? "meta"
+        : sourceText
+          ? "other"
+          : "direct";
+
+  const forced = params.get("rum_test") === "1";
+  const sampleRate = forced ? 1 : 0.25;
+
+  let sampled = forced;
+  if (!forced) {
+    try {
+      const existing = sessionStorage.getItem(SAMPLE_KEY);
+      if (existing === "1" || existing === "0") {
+        sampled = existing === "1";
+      } else {
+        sampled = Math.random() < sampleRate;
+        sessionStorage.setItem(SAMPLE_KEY, sampled ? "1" : "0");
+      }
+    } catch (_) {
+      sampled = Math.random() < sampleRate;
+    }
+  }
+
+  if (!sampled) return;
+
+  const device = innerWidth < 768 ? "mobile" : innerWidth < 992 ? "tablet" : "desktop";
+  const navigation = performance.getEntriesByType("navigation")[0];
+  const pending = new Map();
+  let flushTimer = 0;
+
+  function queueMetric(metric, value) {
+    const number = Number(value);
+    if (!Number.isFinite(number) || number < 0) return;
+    pending.set(metric, number);
+    scheduleFlush(700);
+  }
+
+  function payloadFromPending() {
+    const events = Array.from(pending, ([metric, value]) => ({ metric, value }));
+    if (!events.length) return null;
+    pending.clear();
+
+    return {
+      path: location.pathname,
+      device,
+      source,
+      inApp: /FBAN|FBAV|Instagram/i.test(userAgent),
+      navigationType: navigation?.type || "",
+      viewportWidth: innerWidth,
+      sampleRate,
+      events
+    };
+  }
+
+  function sendBatch() {
+    clearTimeout(flushTimer);
+    flushTimer = 0;
+
+    const payload = payloadFromPending();
+    if (!payload) return;
+
+    const body = JSON.stringify(payload);
+
+    try {
+      if (
+        navigator.sendBeacon &&
+        navigator.sendBeacon(
+          ENDPOINT,
+          new Blob([body], { type: "text/plain;charset=UTF-8" })
+        )
+      ) {
+        return;
+      }
+    } catch (_) {}
+
+    fetch(ENDPOINT, {
+      method: "POST",
+      headers: { "Content-Type": "text/plain;charset=UTF-8" },
+      body,
+      keepalive: true,
+      credentials: "omit",
+      mode: "cors"
+    }).catch(() => {});
+  }
+
+  function scheduleFlush(delay) {
+    clearTimeout(flushTimer);
+    flushTimer = setTimeout(sendBatch, delay);
+  }
+
+  function hookCheckoutTimings() {
+    if (location.pathname !== "/secure-checkout") return;
+
+    const container = document.getElementById("fsu-checkout-container");
+    if (!container) return;
+
+    let initialReadySent = false;
+    let bumpStartedAt = 0;
+
+    function checkReady() {
+      const frame = container.querySelector(".fsu-paypro-frame.is-ready");
+      if (!frame) return;
+
+      if (!initialReadySent) {
+        initialReadySent = true;
+        queueMetric("IFRAME", performance.now());
+      }
+
+      if (bumpStartedAt > 0) {
+        queueMetric("BUMP", performance.now() - bumpStartedAt);
+        bumpStartedAt = 0;
+      }
+    }
+
+    const observer = new MutationObserver(checkReady);
+    observer.observe(container, {
+      subtree: true,
+      childList: true,
+      attributes: true,
+      attributeFilter: ["class"]
+    });
+
+    function markBumpStart(event) {
+      const topBar = event.target?.closest?.(".bump-top-bar");
+      if (!topBar) return;
+
+      if (
+        event.type === "keydown" &&
+        event.key !== "Enter" &&
+        event.key !== " "
+      ) {
+        return;
+      }
+
+      bumpStartedAt = performance.now();
+    }
+
+    document.addEventListener("click", markBumpStart, true);
+    document.addEventListener("keydown", markBumpStart, true);
+    checkReady();
+  }
+
+  function loadVitals() {
+    if (window.webVitals) {
+      startVitals();
+      return;
+    }
+
+    const script = document.createElement("script");
+    script.src = LIBRARY;
+    script.async = true;
+    script.crossOrigin = "anonymous";
+    script.onload = startVitals;
+    script.onerror = () => {};
+    document.head.appendChild(script);
+  }
+
+  let vitalsStarted = false;
+  function startVitals() {
+    if (vitalsStarted || !window.webVitals) return;
+    vitalsStarted = true;
+
+    const report = metric => queueMetric(metric.name, metric.value);
+
+    webVitals.onCLS(report);
+    webVitals.onINP(report);
+    webVitals.onLCP(report);
+    webVitals.onFCP(report);
+    webVitals.onTTFB(report);
+  }
+
+  hookCheckoutTimings();
+
+  if (document.readyState === "complete") {
+    if ("requestIdleCallback" in window) {
+      requestIdleCallback(loadVitals, { timeout: 1500 });
+    } else {
+      setTimeout(loadVitals, 0);
+    }
+  } else {
+    addEventListener("load", () => {
+      if ("requestIdleCallback" in window) {
+        requestIdleCallback(loadVitals, { timeout: 1500 });
+      } else {
+        setTimeout(loadVitals, 0);
+      }
+    }, { once: true });
+  }
+
+  addEventListener("pagehide", sendBatch);
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") sendBatch();
+  });
+})();`;
 
 export default function handler(req, res) {
-  if (req.method !== 'GET') {
-    res.setHeader('Allow', 'GET');
+  if (req.method !== "GET") {
+    res.setHeader("Allow", "GET");
     return res.status(405).end();
   }
-  res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
-  res.setHeader('Cache-Control', 'public, max-age=300, s-maxage=300');
-  res.setHeader('X-Content-Type-Options', 'nosniff');
+
+  res.setHeader("Content-Type", "application/javascript; charset=utf-8");
+  res.setHeader("Cache-Control", "public, max-age=300, s-maxage=300");
+  res.setHeader("X-Content-Type-Options", "nosniff");
   return res.status(200).send(SCRIPT);
 }
