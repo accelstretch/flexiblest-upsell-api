@@ -3,7 +3,7 @@ const RETENTION_SECONDS = 30 * 24 * 60 * 60;
 const MAX_EVENTS = 5000;
 const LIST_KEY = "webvitals:events:v1";
 
-const ALLOWED_METRICS = new Set(["LCP", "INP", "CLS", "FCP", "TTFB"]);
+const ALLOWED_METRICS = new Set(["LCP", "INP", "CLS", "FCP", "TTFB", "IFRAME", "BUMP"]);
 const ALLOWED_DEVICES = new Set(["mobile", "tablet", "desktop", "unknown"]);
 const ALLOWED_SOURCES = new Set(["facebook", "instagram", "meta", "other", "direct", "unknown"]);
 
