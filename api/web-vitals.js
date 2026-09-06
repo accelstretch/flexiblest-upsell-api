@@ -120,6 +120,7 @@ export default async function handler(req, res) {
     await redisCommand(["LTRIM", LIST_KEY, String(-MAX_EVENTS), "-1"]);
     await redisCommand(["EXPIRE", LIST_KEY, String(RETENTION_SECONDS)]);
 
+    console.log("web_vital", event);
     return res.status(204).end();
   } catch (error) {
     const message = clean(error?.message, 100);
