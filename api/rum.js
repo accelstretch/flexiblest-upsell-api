@@ -65,6 +65,24 @@ const SCRIPT = `(() => {
 
   if (!sampled) return;
 
+  if (forced && location.pathname === "/accelstretch") {
+    function preserveForcedTestOnCheckout(event) {
+      const link = event.target?.closest?.('a[href]');
+      if (!link) return;
+      try {
+        const url = new URL(link.href, location.href);
+        if (
+          url.origin === location.origin &&
+          url.pathname === "/secure-checkout"
+        ) {
+          url.searchParams.set("rum_test", "1");
+          link.href = url.pathname + url.search + url.hash;
+        }
+      } catch (_) {}
+    }
+    document.addEventListener("click", preserveForcedTestOnCheckout, true);
+  }
+
   const device = innerWidth < 768 ? "mobile" : innerWidth < 992 ? "tablet" : "desktop";
   const navigation = performance.getEntriesByType("navigation")[0];
   const pending = new Map();
