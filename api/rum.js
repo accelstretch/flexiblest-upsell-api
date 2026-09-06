@@ -7,6 +7,7 @@ const SCRIPT = `(() => {
   const ENDPOINT = "https://api.flexiblest.io/api/web-vitals";
   const LIBRARY = "https://unpkg.com/web-vitals@6.2.0/dist/web-vitals.iife.js";
   const SAMPLE_KEY = "fs_rum_sample_v2";
+  const FORCE_KEY = "fs_rum_force_v2";
   const params = new URLSearchParams(location.search);
 
   let storedAttribution = {};
@@ -36,7 +37,15 @@ const SCRIPT = `(() => {
           ? "other"
           : "direct";
 
-  const forced = params.get("rum_test") === "1";
+  let forced = params.get("rum_test") === "1";
+  try {
+    if (forced) {
+      sessionStorage.setItem(FORCE_KEY, "1");
+    } else {
+      forced = sessionStorage.getItem(FORCE_KEY) === "1";
+    }
+  } catch (_) {}
+
   const sampleRate = forced ? 1 : 0.25;
 
   let sampled = forced;
