@@ -202,7 +202,12 @@ const SCRIPT = `(() => {
     if (vitalsStarted || !window.webVitals) return;
     vitalsStarted = true;
 
-    const report = metric => queueMetric(metric.name, metric.value);
+    const report = metric => {
+      queueMetric(metric.name, metric.value);
+      if (document.visibilityState === "hidden") {
+        sendBatch();
+      }
+    };
 
     webVitals.onCLS(report);
     webVitals.onINP(report);
