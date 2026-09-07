@@ -27,9 +27,9 @@ const SCRIPT = `(() => {
     ""
   ).toLowerCase();
 
-  const source = /instagram/.test(sourceText + " " + userAgent)
+  const source = /instagram/i.test(sourceText + " " + userAgent)
     ? "instagram"
-    : /facebook|fbav|fban/.test(sourceText + " " + userAgent)
+    : /facebook|fbav|fban/i.test(sourceText + " " + userAgent)
       ? "facebook"
       : /meta/.test(sourceText)
         ? "meta"
