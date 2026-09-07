@@ -3,7 +3,7 @@ import crypto from "node:crypto";
 const COMETLY_API_URL =
   "https://app.cometly.com/public-api/v1/events/track";
 
-const TEST_EMAIL = "cometly-server-test@example.com";
+
 const TEST_URL = "https://flexiblest.com/secure-checkout";
 
 function clean(value, maxLength = 500) {
@@ -78,15 +78,22 @@ export default async function handler(req, res) {
     });
   }
 
+  const testEmail = clean(process.env.COMETLY_SERVER_TEST_EMAIL, 254);
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(testEmail)) {
+    return res.status(503).json({ok: false, error: "A valid test email must be configured"});
+  }
+
   const testId = `cometly-server-test-${crypto.randomUUID()}`;
   const event = {
     event_name: getConfiguredEventName(),
-    email: TEST_EMAIL,
+    email: testEmail,
     first_name: "Cometly",
     last_name: "Server Test",
     event_time: new Date().toISOString(),
     url: TEST_URL,
     amount: 0,
+    do_not_capi: true,
+    order_name: "TEST ONLY - server diagnostic - zero revenue",
     currency: "USD",
     order_id: testId,
     tracking_id: testId,
@@ -123,6 +130,7 @@ export default async function handler(req, res) {
     return res.status(200).json({
       ok: true,
       sent_to_cometly: true,
+      processing_status: "queued",
       event_name: event.event_name,
       test_id: testId
     });

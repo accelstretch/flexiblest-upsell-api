@@ -421,9 +421,24 @@ function mergePayProData(input) {
     raw.CHECKOUT_QUERY_STRING
   );
 
-  const customFieldData = parseParamString(
-    raw.ORDER_CUSTOM_FIELDS
-  );
+  let customFields = raw.ORDER_CUSTOM_FIELDS;
+  if (isPlainObject(customFields)) {
+    customFields = new URLSearchParams(customFields).toString();
+  } else {
+    customFields = String(customFields ?? "").trim();
+    // Some IPNs encode the entire custom-field string, not just values.
+    // Decode only that envelope; leave normally encoded values intact.
+    for (let depth = 0; depth < 2 && /^[A-Za-z_][A-Za-z0-9_-]*%3d/i.test(customFields); depth++) {
+      try {
+        customFields = decodeURIComponent(customFields.replace(/\+/g, " "));
+      } catch {
+        break;
+      }
+    }
+    // Preserve value commas, such as a list of selected bump product IDs.
+    customFields = customFields.replace(/,\s*(?=[A-Za-z_][A-Za-z0-9_-]*=)/g, "&");
+  }
+  const customFieldData = parseParamString(customFields);
 
   return {
     ...customFieldData,
@@ -496,7 +511,7 @@ function isCheckoutBumpIpn(data) {
   return (
     isCheckoutMain(data) &&
     Boolean(productId) &&
-    productId !== MAIN_CHECKOUT_PRODUCT_ID
+    ["133565", "133569"].includes(productId)
   );
 }
 
@@ -2193,6 +2208,28 @@ export default async function handler(req, res) {
           );
       }
 
+      // Explicit server-side allowlist for end-to-end diagnostics. Ordinary
+      // PayPro test orders remain suppressed. Never send test revenue or CAPI.
+      const diagnosticAllowed = String(process.env.COMETLY_TEST_ORDER_IDS || "")
+        .split(",").map((id) => id.trim()).includes(orderId);
+      let diagnosticDelivery = null;
+      let diagnosticId = null;
+      if (diagnosticAllowed) {
+        const event = buildCometlyEvent(data, req, authorization.session, eventKind);
+        diagnosticId = `paypro-test-${orderId}-${event.event_name}`;
+        event.amount = 0;
+        event.order_id = diagnosticId;
+        event.idempotency_key = diagnosticId;
+        event.order_name = `TEST ONLY - ${event.order_name || eventKind} - zero revenue`;
+        event.do_not_capi = true;
+        diagnosticDelivery = await sendCometlyEvent(event);
+        console.log("COMETLY TEST EVENT ACCEPTED", {
+          paypro_order_id: orderId, test_id: diagnosticId,
+          event_name: event.event_name, amount: 0, do_not_capi: true,
+          accepted: diagnosticDelivery.sent === true
+        });
+      }
+
       return res.status(200).json({
         ok: true,
         test_mode: true,
@@ -2203,7 +2240,8 @@ export default async function handler(req, res) {
         kajabi_access_updated: false,
         kajabi_test_skipped:
           kajabiAccess.reason === "test_mode",
-        sent_to_cometly: false
+        sent_to_cometly: diagnosticDelivery?.sent === true,
+        cometly_test_id: diagnosticId
       });
     }
 
