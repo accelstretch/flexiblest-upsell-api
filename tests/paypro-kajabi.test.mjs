@@ -10,6 +10,10 @@ process.env.KV_REST_API_URL = "https://redis.test";
 process.env.KV_REST_API_TOKEN = "redis-token";
 process.env.PAYPRO_VALIDATION_KEY = VALIDATION_KEY;
 process.env.COMETLY_API_KEY = "cometly-test";
+process.env.PAYPRO_VENDOR_ACCOUNT_ID = "123456";
+process.env.PAYPRO_API_SECRET_KEY = "test-only-secret";
+const apiOrders = new Map();
+const financialCalls = [];
 
 const offers = [
   {
@@ -85,6 +89,11 @@ function handleRedisCommand(command) {
   }
 
   if (operation === "EVAL") {
+    if (String(command[2]) === '2') {
+      if (redis.get(command[3]) !== command[5]) return 0;
+      redis.set(command[4], command[6]);
+      return 1;
+    }
     const key = command[3];
     const token = command[4];
 
@@ -101,6 +110,16 @@ function handleRedisCommand(command) {
 
 global.fetch = async function mockFetch(url, options = {}) {
   const target = String(url);
+  if (target === 'https://store.payproglobal.com/api/Orders/GetOrderDetails') {
+    return Response.json({isSuccess:true,response:apiOrders.get(String(JSON.parse(options.body).orderId))});
+  }
+  if (target === 'https://app.cometly.com/public-api/v1/events/track') {
+    const event=JSON.parse(options.body);
+    assert.ok(['custom_event_2','custom_event_3'].includes(event.event_name));
+    assert.equal(event.do_not_capi,true);
+    financialCalls.push(event);
+    return Response.json({success:true});
+  }
 
   if (target === process.env.KV_REST_API_URL) {
     const command = JSON.parse(options.body);
@@ -196,6 +215,8 @@ async function sendIpn({
   };
 
   body.SIGNATURE = signatureFor(body);
+  const net=Number(itemTotal)-2-Number(itemRefunded)-(orderStatus==='Chargeback'?Number(itemTotal)+15:0);
+  apiOrders.set(orderId,{orderId:Number(orderId),isTestMode:false,balanceCurrencyCode:'USD',orderStatusId:orderStatus==='Refunded'?3:orderStatus==='Chargeback'?4:5,createdAt:'2026-09-19T10:00:00.000',customer:{email:'buyer@example.com'},balanceVendorTotalAmount:net,balanceRefundedAmount:Number(itemRefunded),orderItems:[{productId:Number(productId),balanceVendorAmount:net}]});
 
   const res = createResponse();
 
@@ -259,10 +280,12 @@ async function testDuplicateProtection() {
     orderItemId: "930101"
   };
 
+  const before=financialCalls.length;
   await sendIpn(input);
   await sendIpn(input);
 
   assert.equal(kajabiCalls.length, 1);
+  assert.equal(financialCalls.length-before,1);
 }
 
 async function testRefundAndChargebackLifecycle() {

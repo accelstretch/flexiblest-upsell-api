@@ -2038,7 +2038,7 @@ function sendSkipped(res, reason, extra = {}) {
   });
 }
 
-export default async function handler(req, res) {
+async function purchaseHandler(req, res) {
   res.setHeader(
     "Cache-Control",
     "no-store, max-age=0"
@@ -2357,4 +2357,10 @@ export default async function handler(req, res) {
       error: "Webhook processing failed"
     });
   }
+}
+
+// Financial reporting runs only after the original authenticated order handler.
+import { withFinancials } from '../lib/paypro-financials.js';
+export default async function handler(req, res) {
+  return withFinancials(purchaseHandler, req, res);
 }
