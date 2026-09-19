@@ -1,0 +1,345 @@
+<style>
+.dropdown-toggle .faq-arrow {
+  transition: transform 0.2s ease-out;
+  transform: rotate(0deg);
+}
+
+
+.dropdown-toggle.w--open .faq-arrow {
+  transform: rotate(180deg);
+}
+</style>
+
+<script>
+/* FLEXIBLEST ATTRIBUTION BRIDGE */
+(function () {
+  "use strict";
+
+  if (window.__flexiblestAttributionBridgeInstalled) {
+    return;
+  }
+
+  window.__flexiblestAttributionBridgeInstalled = true;
+
+  var STORAGE_KEY = "fs_attribution_data";
+  var FUNNEL_SESSION_URL =
+    "https://api.flexiblest.io/api/paypro-funnel-session";
+  var PAYPRO_HOST = "store.payproglobal.com";
+  var DATA_KEYS = [
+    "comet_source",
+    "comet_ad_id",
+    "comet_placement",
+    "site_source_name",
+    "ad_id",
+    "placement",
+    "cometly_click_id",
+    "fbclid",
+    "fbc",
+    "fbp",
+    "gclid",
+    "gbraid",
+    "wbraid",
+    "ttclid",
+    "utm_source",
+    "utm_medium",
+    "utm_campaign",
+    "utm_content",
+    "utm_term",
+    "campaign_id",
+    "adset_id"
+  ];
+  var SAFE_CONTEXT_KEYS = DATA_KEYS.concat([
+    "landing_page_url",
+    "latest_page_url",
+    "latest_referrer",
+    "first_referrer",
+    "referrer_url",
+    "checkout_page_url",
+    "updated_at"
+  ]);
+  var SAFE_URL_KEYS = {
+    landing_page_url: true,
+    latest_page_url: true,
+    latest_referrer: true,
+    first_referrer: true,
+    referrer_url: true,
+    checkout_page_url: true
+  };
+
+  function clean(value) {
+    return String(value || "").trim().slice(0, 2000);
+  }
+
+  function readStored() {
+    try {
+      var value = JSON.parse(
+        window.localStorage.getItem(STORAGE_KEY) || "{}"
+      );
+
+      return value && typeof value === "object" && !Array.isArray(value)
+        ? value
+        : {};
+    } catch (error) {
+      return {};
+    }
+  }
+
+  function writeStored(value) {
+    try {
+      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(value));
+    } catch (error) {}
+  }
+
+  function pageUrl() {
+    return window.location.origin + window.location.pathname;
+  }
+
+  function safePageUrl(value) {
+    try {
+      var url = new URL(value, window.location.href);
+      return url.origin + url.pathname;
+    } catch (error) {
+      return "";
+    }
+  }
+
+  function safeContext(value) {
+    var source = value && typeof value === "object" ? value : {};
+    var result = {};
+
+    SAFE_CONTEXT_KEYS.forEach(function (key) {
+      var item = SAFE_URL_KEYS[key]
+        ? safePageUrl(source[key])
+        : clean(source[key]);
+
+      if (item) {
+        result[key] = item;
+      }
+    });
+
+    return result;
+  }
+
+  function param(params, names) {
+    for (var i = 0; i < names.length; i += 1) {
+      var value = clean(params.get(names[i]));
+
+      if (value) {
+        return value;
+      }
+    }
+
+    return "";
+  }
+
+  function captureAttribution() {
+    var stored = readStored();
+    var params = new URLSearchParams(window.location.search);
+    var next = Object.assign({}, stored);
+    var aliases = {
+      comet_source: ["comet_source", "site_source_name", "utm_source"],
+      comet_ad_id: ["comet_ad_id", "ad_id"],
+      comet_placement: ["comet_placement", "placement"],
+      site_source_name: ["site_source_name"],
+      ad_id: ["ad_id", "comet_ad_id"],
+      placement: ["placement", "comet_placement"],
+      cometly_click_id: ["cometly_click_id", "cometly_id"]
+    };
+
+    DATA_KEYS.forEach(function (key) {
+      var value = aliases[key]
+        ? param(params, aliases[key])
+        : clean(params.get(key));
+
+      if (value) {
+        next[key] = value;
+      }
+    });
+
+    if (!next.landing_page_url) {
+      next.landing_page_url = pageUrl();
+    }
+
+    next.latest_page_url = pageUrl();
+    next.latest_referrer = safePageUrl(document.referrer);
+    next.first_referrer =
+      clean(stored.first_referrer) || safePageUrl(document.referrer);
+    next.updated_at = new Date().toISOString();
+
+    writeStored(next);
+    return next;
+  }
+
+  var attribution = captureAttribution();
+
+  function injectAttribution(body) {
+    if (!body || typeof body !== "object") {
+      return body;
+    }
+
+    var next = Object.assign({}, body);
+    next.attribution = Object.assign(
+      {},
+      safeContext(body.attribution || body.attribution_data),
+      attribution
+    );
+    next.page_url = safePageUrl(next.page_url) || pageUrl();
+    next.referrer_url =
+      safePageUrl(next.referrer_url) || safePageUrl(document.referrer);
+    return next;
+  }
+
+  var nativeFetch = window.fetch;
+
+  if (typeof nativeFetch === "function") {
+    window.fetch = function (input, init) {
+      var requestUrl =
+        typeof input === "string"
+          ? input
+          : input && input.url
+            ? input.url
+            : "";
+
+      if (
+        requestUrl.indexOf(FUNNEL_SESSION_URL) === 0 &&
+        init &&
+        typeof init.body === "string"
+      ) {
+        try {
+          var body = JSON.parse(init.body);
+
+          if (
+            body.action === "create" ||
+            body.action === "save_checkout_email"
+          ) {
+            init = Object.assign({}, init, {
+              body: JSON.stringify(injectAttribution(body))
+            });
+          }
+        } catch (error) {}
+      }
+
+      return nativeFetch.call(this, input, init);
+    };
+  }
+
+  function addPayProAttribution(node) {
+    if (!node || node.nodeType !== 1 || node.tagName !== "IFRAME") {
+      return;
+    }
+
+    var source = clean(node.getAttribute("src"));
+
+    if (!source) {
+      return;
+    }
+
+    try {
+      var url = new URL(source, window.location.href);
+
+      if (url.hostname !== PAYPRO_HOST || url.pathname !== "/checkout") {
+        return;
+      }
+
+      // Only non-personal ad metadata is added to the PayPro URL.
+      [
+        ["x-comet_source", attribution.comet_source],
+        ["x-comet_ad_id", attribution.comet_ad_id],
+        ["x-comet_placement", attribution.comet_placement],
+        ["x-site_source_name", attribution.site_source_name],
+        ["x-ad_id", attribution.ad_id],
+        ["x-placement", attribution.placement]
+      ].forEach(function (entry) {
+        if (entry[1] && !url.searchParams.get(entry[0])) {
+          url.searchParams.set(entry[0], clean(entry[1]));
+        }
+      });
+
+      // Only write the attribute when attribution actually changed it.
+      // The observer below watches the src attribute; rewriting the same value on every
+      // observation creates a mutation loop that can freeze the page.
+      var nextSource = url.toString();
+
+      if (nextSource !== source) {
+        node.setAttribute("src", nextSource);
+      }
+    } catch (error) {}
+  }
+
+  var nativeAppendChild = Node.prototype.appendChild;
+
+  Node.prototype.appendChild = function (child) {
+    addPayProAttribution(child);
+    return nativeAppendChild.call(this, child);
+  };
+
+  if (typeof MutationObserver === "function") {
+    new MutationObserver(function (mutations) {
+      mutations.forEach(function (mutation) {
+        if (mutation.type === "attributes") {
+          addPayProAttribution(mutation.target);
+        }
+
+        (mutation.addedNodes || []).forEach(function (node) {
+          addPayProAttribution(node);
+        });
+      });
+    }).observe(document.documentElement, {
+      subtree: true,
+      childList: true,
+      attributes: true,
+      attributeFilter: ["src"]
+    });
+  }
+
+  function wrapCometly() {
+    if (
+      typeof window.comet !== "function" ||
+      window.comet.__flexiblestAttributionBridge
+    ) {
+      return;
+    }
+
+    var nativeComet = window.comet;
+    var wrappedComet = function (eventName, payload) {
+      var nextPayload =
+        payload && typeof payload === "object"
+          ? Object.assign({}, payload, attribution)
+          : payload;
+
+      return nativeComet.call(this, eventName, nextPayload);
+    };
+
+    wrappedComet.__flexiblestAttributionBridge = true;
+    window.comet = wrappedComet;
+  }
+
+  wrapCometly();
+  window.setInterval(wrapCometly, 250);
+})();
+
+</script>
+<style id="fs-image-space">
+img[src="https://cdn.prod.website-files.com/6a03431c69525d9b38087e23/6a0355bcb8f635606119885c_flexiblest-logo-accelstretch.webp"] { aspect-ratio: auto 500 / 500; }
+img[src="https://cdn.prod.website-files.com/6a03431c69525d9b38087e23/6a59c48fc2e674ab46103ef8_people-1.webp"] { aspect-ratio: auto 500 / 76; }
+img[src="https://cdn.prod.website-files.com/6a03431c69525d9b38087e23/6a60b247644365cdabe63706_its-the-method.webp"] { aspect-ratio: auto 500 / 322; }
+img[src="https://cdn.prod.website-files.com/6a03431c69525d9b38087e23/6a13b25637421d3256cadff8_tight-muscles-stretching.webp"] { aspect-ratio: auto 500 / 333; }
+img[src="https://cdn.prod.website-files.com/6a03431c69525d9b38087e23/6a16692dcde9f39c742ce215_flexiblest-accelstretch-stretching-mechanism.webp"] { aspect-ratio: auto 1875 / 1250; }
+img[src="https://cdn.prod.website-files.com/6a03431c69525d9b38087e23/6a602a5c15c686eab78c714e_accelstretch-contract-relax.webp"] { aspect-ratio: auto 1306 / 688; }
+img[src="https://cdn.prod.website-files.com/6a03431c69525d9b38087e23/6aa40ab95e7d99942c1cdf23_accelstretch-stretch-reflexwebp.webp"] { aspect-ratio: auto 500 / 263; }
+img[src="https://cdn.prod.website-files.com/6a03431c69525d9b38087e23/6a602a5c8e910069273429bd_acclestretch-never-late.webp"] { aspect-ratio: auto 1306 / 688; }
+img[src="https://cdn.prod.website-files.com/6a03431c69525d9b38087e23/6a609679c5e70a0e4bccf2e2_new-timer.webp"] { aspect-ratio: auto 1306 / 688; }
+img[src="https://cdn.prod.website-files.com/6a03431c69525d9b38087e23/6a609d33a0b988f9830f0d1a_flexiblest-founder-accelstretch.webp"] { aspect-ratio: auto 1260 / 808; }
+img[src="https://cdn.prod.website-files.com/6a03431c69525d9b38087e23/6a6bbf9c3cf42060394f7af8_accelstretch-method-flexiblest.webp"] { aspect-ratio: auto 1512 / 770; }
+img[src="https://cdn.prod.website-files.com/6a03431c69525d9b38087e23/6a1bfee5850dcc5431c4c500_mobility-accelstretch-flexiblest.webp"] { aspect-ratio: auto 1384 / 1069; }
+img[src="https://cdn.prod.website-files.com/6a03431c69525d9b38087e23/6a1c3541cb2062e811ed605b_forward-folds-accelstretch-flexiblest.webp"] { aspect-ratio: auto 1384 / 1069; }
+img[src="https://cdn.prod.website-files.com/6a03431c69525d9b38087e23/6a1c2a965fed8844a92e0910_accelstretch-splits-accelerator.webp"] { aspect-ratio: auto 1384 / 1069; }
+img[src="https://cdn.prod.website-files.com/6a03431c69525d9b38087e23/6a1c3b3b8b7d2d08a183519e_morning-evening-accelstretch-flows.webp"] { aspect-ratio: auto 1230 / 950; }
+img[src="https://cdn.prod.website-files.com/6a03431c69525d9b38087e23/6a1c2c6b86c77558ace08dc7_flexiblest-accelstretch-split-accelerator.webp"] { aspect-ratio: auto 1382 / 943; }
+img[src="https://cdn.prod.website-files.com/6a03431c69525d9b38087e23/6a1c2b6ba75f99c148c95470_easy-backbends-accelstretch.webp"] { aspect-ratio: auto 1384 / 1069; }
+img[src="https://cdn.prod.website-files.com/6a03431c69525d9b38087e23/6a6b3b40a679a6e16f81c74c_weekly-stretch.webp"] { aspect-ratio: auto 1200 / 900; }
+img[src="https://cdn.prod.website-files.com/6a03431c69525d9b38087e23/6a6b727bc656e6a4d63f33e2_flexiblest-joint-longevity-accelstretch.webp"] { aspect-ratio: auto 1200 / 900; }
+img[src="https://cdn.prod.website-files.com/6a03431c69525d9b38087e23/6a62e242234c5d26d37ddb2d_flexiblest-accestretch-team.webp"] { aspect-ratio: auto 1350 / 881; }
+img[src="https://cdn.prod.website-files.com/6a03431c69525d9b38087e23/6a225232a84424046a356af8_payment-logos.png"] { aspect-ratio: auto 578 / 80; }
+img[src="https://cdn.prod.website-files.com/6a03431c69525d9b38087e23/6a1c48f781b18d9459a3211f_guarantee-crest.webp"] { aspect-ratio: auto 450 / 450; }
+</style>

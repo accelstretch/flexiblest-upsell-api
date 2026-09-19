@@ -1413,12 +1413,19 @@ function buildCometlyEvent(data, req, session, kind) {
       ["comet_source", "site_source_name"]
     ) || utmSource;
 
-  const cometAdId =
-    getAttributionValue(
-      session,
-      data,
-      ["comet_ad_id", "ad_id"]
-    ) || fbclid;
+  // A click identifier is never an ad identifier. Validate each candidate
+  // independently so a malformed canonical value cannot hide a valid alias.
+  const metaSource = /^(fb|ig|facebook|instagram|meta|an|audience_network|messenger)$/i.test(cometSource);
+  const adCandidates = [
+    session?.attribution?.comet_ad_id,
+    session?.attribution?.ad_id,
+    pick(data, ["x-comet_ad_id", "comet_ad_id"], 300),
+    pick(data, ["x-ad_id", "ad_id"], 300)
+  ].map(value => clean(value, 300));
+  const cometAdId = adCandidates.find(value =>
+    value && value !== fbclid && value !== fbc && value !== fbp &&
+    !value.includes("{{") && (!metaSource || /^[0-9]+$/.test(value))
+  ) || "";
 
   const cometPlacement = getAttributionValue(
     session,

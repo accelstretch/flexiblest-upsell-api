@@ -1,0 +1,327 @@
+<link rel="dns-prefetch" href="//store.payproglobal.com">
+<link rel="preconnect" href="https://store.payproglobal.com" crossorigin>
+
+
+<style>
+  #fsu-checkout-container {
+    position: relative !important;
+    isolation: isolate;
+    width: 100% !important;
+    max-width: 100% !important;
+    min-height: 1px;
+    margin: 0 !important;
+    padding: 0 !important;
+    background: #ffffff !important;
+    border-radius: 16px !important;
+    overflow: hidden !important;
+    overflow-anchor: none;
+    box-sizing: border-box !important;
+    transition: height 180ms ease-out;
+  }
+
+
+  #fsu-checkout-container::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    z-index: 2147483647;
+    pointer-events: none;
+    border: 1px solid #e7e3df;
+    border-radius: 16px;
+    box-sizing: border-box;
+  }
+
+
+  #fsu-checkout-container iframe {
+    display: block !important;
+    position: relative !important;
+    z-index: 0 !important;
+    width: 100% !important;
+    max-width: 100% !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    border: 0 !important;
+    border-radius: 15px !important;
+    background: #ffffff !important;
+    transition: height 180ms ease-out;
+  }
+
+
+  @media (prefers-reduced-motion: reduce) {
+    #fsu-checkout-container,
+    #fsu-checkout-container iframe {
+      transition: none !important;
+    }
+  }
+</style>
+
+<script>
+/* FLEXIBLEST ATTRIBUTION BRIDGE */
+(function () {
+  "use strict";
+
+  if (window.__flexiblestAttributionBridgeInstalled) {
+    return;
+  }
+
+  window.__flexiblestAttributionBridgeInstalled = true;
+
+  var STORAGE_KEY = "fs_attribution_data";
+  var FUNNEL_SESSION_URL =
+    "https://api.flexiblest.io/api/paypro-funnel-session";
+  var PAYPRO_HOST = "store.payproglobal.com";
+  var DATA_KEYS = [
+    "comet_source",
+    "comet_ad_id",
+    "comet_placement",
+    "site_source_name",
+    "ad_id",
+    "placement",
+    "cometly_click_id",
+    "fbclid",
+    "fbc",
+    "fbp",
+    "gclid",
+    "gbraid",
+    "wbraid",
+    "ttclid",
+    "utm_source",
+    "utm_medium",
+    "utm_campaign",
+    "utm_content",
+    "utm_term",
+    "campaign_id",
+    "adset_id"
+  ];
+
+  function clean(value) {
+    return String(value || "").trim().slice(0, 2000);
+  }
+
+  function readStored() {
+    try {
+      var value = JSON.parse(
+        window.localStorage.getItem(STORAGE_KEY) || "{}"
+      );
+
+      return value && typeof value === "object" && !Array.isArray(value)
+        ? value
+        : {};
+    } catch (error) {
+      return {};
+    }
+  }
+
+  function writeStored(value) {
+    try {
+      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(value));
+    } catch (error) {}
+  }
+
+  function pageUrl() {
+    return window.location.origin + window.location.pathname;
+  }
+
+  function param(params, names) {
+    for (var i = 0; i < names.length; i += 1) {
+      var value = clean(params.get(names[i]));
+
+      if (value) {
+        return value;
+      }
+    }
+
+    return "";
+  }
+
+  function captureAttribution() {
+    var stored = readStored();
+    var params = new URLSearchParams(window.location.search);
+    var next = Object.assign({}, stored);
+    var aliases = {
+      comet_source: ["comet_source", "site_source_name", "utm_source"],
+      comet_ad_id: ["comet_ad_id", "ad_id"],
+      comet_placement: ["comet_placement", "placement"],
+      site_source_name: ["site_source_name"],
+      ad_id: ["ad_id", "comet_ad_id"],
+      placement: ["placement", "comet_placement"],
+      cometly_click_id: ["cometly_click_id", "cometly_id"]
+    };
+
+    DATA_KEYS.forEach(function (key) {
+      var value = aliases[key]
+        ? param(params, aliases[key])
+        : clean(params.get(key));
+
+      if (value) {
+        next[key] = value;
+      }
+    });
+
+    if (!next.landing_page_url) {
+      next.landing_page_url = pageUrl();
+    }
+
+    next.latest_page_url = pageUrl();
+    next.latest_referrer = clean(document.referrer);
+    next.first_referrer =
+      clean(stored.first_referrer) || clean(document.referrer);
+    next.updated_at = new Date().toISOString();
+
+    writeStored(next);
+    return next;
+  }
+
+  var attribution = captureAttribution();
+
+  function injectAttribution(body) {
+    if (!body || typeof body !== "object") {
+      return body;
+    }
+
+    var next = Object.assign({}, body);
+    next.attribution = Object.assign(
+      {},
+      body.attribution || body.attribution_data || {},
+      attribution
+    );
+    next.page_url = next.page_url || window.location.href;
+    next.referrer_url = next.referrer_url || document.referrer;
+    return next;
+  }
+
+  var nativeFetch = window.fetch;
+
+  if (typeof nativeFetch === "function") {
+    window.fetch = function (input, init) {
+      var requestUrl =
+        typeof input === "string"
+          ? input
+          : input && input.url
+            ? input.url
+            : "";
+
+      if (
+        requestUrl.indexOf(FUNNEL_SESSION_URL) === 0 &&
+        init &&
+        typeof init.body === "string"
+      ) {
+        try {
+          var body = JSON.parse(init.body);
+
+          if (
+            body.action === "create" ||
+            body.action === "save_checkout_email"
+          ) {
+            init = Object.assign({}, init, {
+              body: JSON.stringify(injectAttribution(body))
+            });
+          }
+        } catch (error) {}
+      }
+
+      return nativeFetch.call(this, input, init);
+    };
+  }
+
+  function addPayProAttribution(node) {
+    if (!node || node.nodeType !== 1 || node.tagName !== "IFRAME") {
+      return;
+    }
+
+    var source = clean(node.getAttribute("src"));
+
+    if (!source) {
+      return;
+    }
+
+    try {
+      var url = new URL(source, window.location.href);
+
+      if (url.hostname !== PAYPRO_HOST || url.pathname !== "/checkout") {
+        return;
+      }
+
+      [
+        ["x-comet_source", attribution.comet_source],
+        ["x-comet_ad_id", attribution.comet_ad_id],
+        ["x-comet_placement", attribution.comet_placement],
+        ["x-site_source_name", attribution.site_source_name],
+        ["x-ad_id", attribution.ad_id],
+        ["x-placement", attribution.placement]
+      ].forEach(function (entry) {
+        if (entry[1] && !url.searchParams.get(entry[0])) {
+          url.searchParams.set(entry[0], clean(entry[1]));
+        }
+      });
+
+      var nextSource = url.toString();
+
+      if (nextSource !== source) {
+        node.setAttribute("src", nextSource);
+      }
+    } catch (error) {}
+  }
+
+  var nativeAppendChild = Node.prototype.appendChild;
+
+  Node.prototype.appendChild = function (child) {
+    addPayProAttribution(child);
+    return nativeAppendChild.call(this, child);
+  };
+
+  if (typeof MutationObserver === "function") {
+    new MutationObserver(function (mutations) {
+      mutations.forEach(function (mutation) {
+        if (mutation.type === "attributes") {
+          addPayProAttribution(mutation.target);
+        }
+
+        (mutation.addedNodes || []).forEach(function (node) {
+          addPayProAttribution(node);
+        });
+      });
+    }).observe(document.documentElement, {
+      subtree: true,
+      childList: true,
+      attributes: true,
+      attributeFilter: ["src"]
+    });
+  }
+
+  function wrapCometly() {
+    if (
+      typeof window.comet !== "function" ||
+      window.comet.__flexiblestAttributionBridge
+    ) {
+      return;
+    }
+
+    var nativeComet = window.comet;
+    var wrappedComet = function (eventName, payload) {
+      var nextPayload =
+        payload && typeof payload === "object"
+          ? Object.assign({}, payload, attribution)
+          : payload;
+
+      return nativeComet.call(this, eventName, nextPayload);
+    };
+
+    wrappedComet.__flexiblestAttributionBridge = true;
+    window.comet = wrappedComet;
+  }
+
+  wrapCometly();
+  window.setInterval(wrapCometly, 250);
+})();
+
+</script>
+<style id="fs-checkout-loading-presentation">
+#fsu-checkout-container:has(>.fsu-checkout-loader){min-height:700px!important}
+@media(max-width:1024px){#fsu-checkout-container:has(>.fsu-checkout-loader){min-height:680px!important}}
+@media(max-width:767px){#fsu-checkout-container:has(>.fsu-checkout-loader){min-height:660px!important}}
+#fsu-checkout-container>.fsu-checkout-loader{position:absolute;inset:0;z-index:2;display:flex;align-items:flex-start!important;justify-content:center;padding:40px 20px!important;box-sizing:border-box;background:#fff;color:#4b4b4b;text-align:center;pointer-events:none}
+#fsu-checkout-container>.fsu-checkout-loader strong{display:block;font-size:16px;font-weight:600;line-height:1.5}
+#fsu-checkout-container>.fsu-checkout-loader span{display:block;margin-top:8px;font-size:13px;font-weight:400;line-height:1.5}
+.product-image{aspect-ratio:auto 1280 / 468}
+</style>

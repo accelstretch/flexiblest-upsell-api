@@ -312,11 +312,11 @@ function sanitizeAttribution(body) {
 
   function valueFor(...keys) {
     for (const key of keys) {
-      if (nested[key] !== undefined && nested[key] !== null) {
+      if (clean(nested[key], 2000)) {
         return nested[key];
       }
 
-      if (body[key] !== undefined && body[key] !== null) {
+      if (clean(body[key], 2000)) {
         return body[key];
       }
     }
@@ -330,7 +330,7 @@ function sanitizeAttribution(body) {
       1000
     ),
     comet_fingerprint: clean(
-      valueFor("comet_fingerprint", "cometly_fingerprint"),
+      valueFor("comet_fingerprint", "cometly_fingerprint", "fingerprint"),
       1000
     ),
     cometly_click_id: clean(
@@ -513,9 +513,11 @@ if session["checkout_completed"] == true or session["status"] == "paid" then
   return "COMPLETED"
 end
 
-session["checkout_email"] = ARGV[3]
-session["precheckout_identity_captured"] = true
-session["precheckout_identity_captured_at"] = ARGV[7]
+if ARGV[3] ~= "" then
+  session["checkout_email"] = ARGV[3]
+  session["precheckout_identity_captured"] = true
+  session["precheckout_identity_captured_at"] = ARGV[7]
+end
 
 if ARGV[4] ~= "" then
   session["checkout_first_name"] = ARGV[4]
@@ -556,20 +558,20 @@ redis.call(
 return "OK"
 `;
 
-async function saveCheckoutEmail(req, body) {
+async function saveCheckoutEmail(req, body, attributionOnly = false) {
   const sessionId = clean(body.fs_session_id, 160);
   const checkoutIntentId = clean(
     body.fs_checkout_intent_id,
     160
   );
   const accessToken = getBearerToken(req);
-  const email = normalizeEmail(
+  const email = attributionOnly ? "" : normalizeEmail(
     body.email || body.checkout_email
   );
-  const firstName = normalizeName(
+  const firstName = attributionOnly ? "" : normalizeName(
     body.first_name || body.checkout_first_name
   );
-  const lastName = normalizeName(
+  const lastName = attributionOnly ? "" : normalizeName(
     body.last_name || body.checkout_last_name
   );
 
@@ -585,7 +587,7 @@ async function saveCheckoutEmail(req, body) {
     );
   }
 
-  if (!validEmail(email)) {
+  if (!attributionOnly && !validEmail(email)) {
     throw new ClientError(
       400,
       "A valid checkout email address is required."
@@ -707,6 +709,11 @@ export default async function handler(req, res) {
         ok: true,
         ...result
       });
+    }
+
+    if (action === "save_attribution") {
+      await saveCheckoutEmail(req, body, true);
+      return sendJson(res, 200, { ok: true, attribution_saved: true });
     }
 
     if (action === "save_checkout_email") {
