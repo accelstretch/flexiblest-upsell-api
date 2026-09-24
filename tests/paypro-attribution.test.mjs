@@ -3,9 +3,10 @@ import {test} from 'node:test';
 import fs from 'node:fs';
 import vm from 'node:vm';
 import crypto from 'node:crypto';
+import {isIP} from 'node:net';
 function load(path, names, overrides={}) {
  const code=fs.readFileSync(new URL(path,import.meta.url),'utf8').replace(/import\s+[\s\S]*?from\s+['"][^'"]+['"];?/g,'').replace(/export default /g,'');
- const ctx=vm.createContext({process,URL,Buffer,console,crypto,...crypto,...overrides});
+ const ctx=vm.createContext({process,URL,Buffer,console,crypto,isIP,...crypto,...overrides});
  vm.runInContext(code+'\nthis.exposed={'+names.join(',')+'}',ctx);
  return ctx.exposed;
 }
@@ -13,7 +14,7 @@ const {buildCometlyEvent}=load('../api/paypro-webhook.js',['buildCometlyEvent'])
 const {sanitizeAttribution}=load('../api/paypro-funnel-session.js',['sanitizeAttribution']);
 const data={ORDER_PLACED_TIME_UTC:'2026-09-19T14:12:28.000Z',ORDER_ID:'90000001',PRODUCT_ID:'133559',CUSTOMER_EMAIL:'fixture@example.com',ORDER_TOTAL_AMOUNT:'39',ORDER_ITEM_TOTAL_AMOUNT:'39',ORDER_CURRENCY_CODE:'USD',ORDER_ITEM_NAME:'AccelStretch System',PAYMENT_METHOD_NAME:'ApplePay'};
 const req={headers:{}};
-const base={fs_session_id:'fsess_fixture_123456789',fs_checkout_intent_id:'fchk_fixture_123456789',attribution:{comet_source:'fb',fbclid:'Iw_fixture_click',fbc:'fb.1.123.Iw_fixture_click',fbp:'fb.1.123.456',utm_term:'120249186591430576'}};
+const base={request_context:{ip_address:'198.51.100.20',user_agent:'Mozilla/fixture'},fs_session_id:'fsess_fixture_123456789',fs_checkout_intent_id:'fchk_fixture_123456789',attribution:{comet_source:'fb',fbclid:'Iw_fixture_click',fbc:'fb.1.123.Iw_fixture_click',fbp:'fb.1.123.456',utm_term:'120249186591430576'}};
 const event=(a={},d={},kind='main')=>buildCometlyEvent({...data,...d},req,{...base,attribution:{...base.attribution,...a}},kind);
 test('click ID never substitutes for missing ad ID; unknown utm_term is not guessed',()=>{
  const e=event();assert.equal(e.comet_ad_id,'');assert.equal(e.profile_field_10,base.attribution.fbclid);assert.equal(e.profile_field_11,base.attribution.fbc);assert.equal(e.profile_field_12,base.attribution.fbp);
@@ -45,14 +46,14 @@ for(const page of ['sales','checkout']) test(page+' bridge refreshes delayed ide
  const storage=m=>({getItem:k=>m.get(k)||null,setItem:(k,v)=>m.set(k,v)});
  class Node {appendChild(child){child.isConnected=true;return child;}}
  const win={location:{origin:'https://flexiblest.com',pathname:'/secure-checkout',search:'?comet_source=fb&comet_ad_id=120249186591430576&fbclid=Iw_fixture_click',href:'https://flexiblest.com/secure-checkout'},localStorage:storage(local),sessionStorage:storage(session),setInterval:fn=>intervals.push(fn),fetch:async(url,init)=>{calls.push({url,body:JSON.parse(init.body)});return {ok:true,status:200};}};
- const ctx=vm.createContext({window:win,document:{referrer:'',documentElement:{}},Node,URL,URLSearchParams,Promise,Date,console});
+ const ctx=vm.createContext({window:win,document:{cookie:'_fbc=fb.1.123.Iw_fixture_click',referrer:'',documentElement:{}},Node,URL,URLSearchParams,Promise,Date,console});
  vm.runInContext(fs.readFileSync(new URL('../webflow/'+page+'-bridge.js',import.meta.url),'utf8'),ctx);
  win.cometToken=()=> 'pixel-token';win.cometFingerprint=async()=> 'pixel-fingerprint';
  for(const[k,v]of Object.entries({fs_session_id:'session-test',fs_checkout_intent_id:'intent-test',fs_funnel_access_token:'access-test'}))session.set(k,v);
  intervals[0]();await new Promise(setImmediate);intervals[0]();await new Promise(setImmediate);
- await win.fetch('https://api.flexiblest.io/api/paypro-funnel-session',{body:JSON.stringify({action:'create',attribution:{fbc:'fbc-existing',fbp:'fbp-existing'}})});
+ await win.fetch('https://api.flexiblest.io/api/paypro-funnel-session',{body:JSON.stringify({action:'create',attribution:{fbc:'fb.1.123.Iw_fixture_click',fbp:'fbp-existing'}})});
  const captured=calls.at(-1).body.attribution;
- assert.equal(captured.comet_token,'pixel-token');assert.equal(captured.comet_fingerprint,'pixel-fingerprint');assert.equal(captured.comet_ad_id,'120249186591430576');assert.equal(captured.fbc,'fbc-existing');
+ assert.equal(captured.comet_token,'pixel-token');assert.equal(captured.comet_fingerprint,'pixel-fingerprint');assert.equal(captured.comet_ad_id,'120249186591430576');assert.equal(captured.fbc,'fb.1.123.Iw_fixture_click');
  let src='https://store.payproglobal.com/checkout?products[1][id]=133559&x-long='+ 'a'.repeat(2100),writes=0;
  const frame={nodeType:1,tagName:'IFRAME',isConnected:false,getAttribute:()=>src,setAttribute:(_,v)=>{src=v;writes++;}};
  new Node().appendChild(frame);assert.equal(new URL(src).searchParams.get('x-comet_token'),'pixel-token');assert.equal(new URL(src).searchParams.get('x-comet_fingerprint'),'pixel-fingerprint');assert.equal(new URL(src).searchParams.get('x-long').length,2100);

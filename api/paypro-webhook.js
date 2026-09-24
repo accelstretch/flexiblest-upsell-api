@@ -1,3 +1,4 @@
+import { isIP } from "node:net";
 import {
   createHash,
   timingSafeEqual
@@ -1447,6 +1448,12 @@ function buildCometlyEvent(data, req, session, kind) {
     ? `paypro-${orderId}-${productId}`
     : `paypro-${orderId}-purchase`;
 
+  const visitorIp = [
+    pick(data, ["CUSTOMER_IP"], 100),
+    clean(requestContext.ip_address, 100)
+  ].find(value => isIP(value)) || "";
+  const visitorUserAgent = clean(requestContext.user_agent, 1500);
+
   const firstName =
     customer.firstName ||
     clean(session.customer_first_name, 100);
@@ -1472,17 +1479,15 @@ function buildCometlyEvent(data, req, session, kind) {
       customer.phone ||
       clean(session.customer_phone, 100),
 
-    ip:
-      pick(data, ["CUSTOMER_IP"], 100) ||
-      clean(requestContext.ip_address, 100) ||
-      getRequestIp(req),
-
-    user_agent:
-      clean(requestContext.user_agent, 1500) ||
-      clean(req.headers["user-agent"], 1500),
+    // Cometly requires fingerprint/IP together. Never use the webhook
+    // sender as a substitute for the visitor. Email/token remain identifiers.
+    ...(visitorIp && fingerprint ? {
+      ip: visitorIp,
+      fingerprint,
+      ...(visitorUserAgent ? { user_agent: visitorUserAgent } : {})
+    } : {}),
 
     comet_token: cometToken,
-    fingerprint,
 
     event_time: getEventTime(data),
     url: getEventUrl(session, data),
