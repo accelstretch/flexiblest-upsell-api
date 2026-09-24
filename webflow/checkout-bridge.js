@@ -78,6 +78,36 @@
     return "";
   }
 
+  function resolveFacebookClick(urlClick, storedClick, cookieFbc, storedFbc) {
+    function click(value) {
+      return typeof value === "string" && /^[A-Za-z0-9_.~-]{1,2000}$/.test(value)
+        ? value : "";
+    }
+    function parse(value) {
+      var match = typeof value === "string" && value.match(/^fb\.[0-9]+\.([0-9]+)\.(.+)$/);
+      return match && Number(match[1]) > 0 && click(match[2])
+        ? { value: value, click: match[2], time: Number(match[1]) } : null;
+    }
+    var cookie = parse(cookieFbc), stored = parse(storedFbc);
+    var candidates = [cookie, stored].filter(Boolean);
+    var currentClick = click(urlClick), previousClick = click(storedClick);
+    var id = currentClick || previousClick;
+    // With no current URL click, do not overwrite a newer coherent cookie
+    // with an older coherent stored pair. An inconsistent stored pair may
+    // be a landing click awaiting reconciliation from the previous code.
+    if (!currentClick && cookie && (!previousClick || (stored && stored.click === previousClick)) &&
+        (!stored || cookie.time > stored.time)) id = cookie.click;
+    if (!id && candidates.length) id = candidates[0].click;
+    if (!id) return { fbclid: "", fbc: "" };
+    var existing = candidates.filter(function (candidate) { return candidate.click === id; })[0];
+    // Keep a stable timestamp even when browser storage/cookies are blocked.
+    var cached = resolveFacebookClick.last;
+    var result = { fbclid: id, fbc: existing ? existing.value :
+      cached && cached.fbclid === id ? cached.fbc : "fb.1." + Date.now() + "." + id };
+    resolveFacebookClick.last = result;
+    return result;
+  }
+
   function captureAttribution() {
     var stored = readStored();
     var params = new URLSearchParams(window.location.search);
@@ -103,6 +133,17 @@
         next[key] = value;
       }
     });
+
+    // Keep the click and its fbc consistent before any session/iframe capture.
+    // Only read existing cookies here; cookie writing remains in checkout.
+    var cookieFbc = "";
+    try {
+      var match = String(document.cookie || "").match(/(?:^|;\s*)_fbc=([^;]*)/);
+      if (match) cookieFbc = decodeURIComponent(match[1]);
+    } catch (error) {}
+    var facebookClick = resolveFacebookClick(params.get("fbclid"), stored.fbclid, cookieFbc, stored.fbc);
+    next.fbclid = facebookClick.fbclid;
+    next.fbc = facebookClick.fbc;
 
     // Read identifiers only from the installed pixel; never synthesize them.
     try {

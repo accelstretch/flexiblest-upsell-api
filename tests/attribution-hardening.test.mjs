@@ -1,0 +1,45 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import vm from 'node:vm';
+import crypto from 'node:crypto';
+import {isIP} from 'node:net';
+const raw=fs.readFileSync(new URL('../api/paypro-webhook.js',import.meta.url),'utf8');
+const ctx=vm.createContext({process:{env:{}},URL,Buffer,console,crypto,...crypto,isIP});
+vm.runInContext(raw.replace(/import\s+[\s\S]*?from\s+['"][^'"]+['"];?/g,'').replace(/export default /g,'')+'\nthis.build=buildCometlyEvent',ctx);
+const data={CUSTOMER_EMAIL:'fixture@example.test',ORDER_ID:'90000001',PRODUCT_ID:'133559',ORDER_TOTAL_AMOUNT:'29',ORDER_CURRENCY_CODE:'USD',ORDER_PLACED_TIME_UTC:'2026-09-24T00:00:00Z'};
+const req={headers:{'x-vercel-forwarded-for':'192.0.2.99','user-agent':'WebhookSender/1'}};
+const build=(d={},s={})=>ctx.build({...data,...d},req,s,'main');
+const session={request_context:{ip_address:'198.51.100.20',user_agent:'Mozilla/visitor'},attribution:{comet_token:'token',comet_fingerprint:'fingerprint',comet_ad_id:'123456',comet_source:'fb'}};
+test('never substitute webhook sender identity; omit incomplete fingerprint/IP and orphan UA',()=>{const x=build({}, {attribution:{comet_fingerprint:'fingerprint',comet_token:'token'}});for(const k of ['ip','user_agent','fingerprint'])assert.equal(Object.hasOwn(x,k),false,k);assert.equal(x.email,data.CUSTOMER_EMAIL);assert.equal(x.comet_token,'token');});
+test('valid visitor pair preserved with exact order and ad identity',()=>{const x=build({},session);assert.equal(x.ip,'198.51.100.20');assert.equal(x.user_agent,'Mozilla/visitor');assert.equal(x.fingerprint,'fingerprint');assert.equal(x.amount,29);assert.equal(x.order_id,'90000001');assert.equal(x.idempotency_key,'paypro-90000001-purchase');assert.equal(x.comet_ad_id,'123456');});
+test('PayPro visitor IPv6 takes precedence; invalid PayPro IP falls back to valid stored visitor',()=>{assert.equal(build({CUSTOMER_IP:'2001:db8::123'},session).ip,'2001:db8::123');for(const ip of ['unknown','999.1.1.1','192.0.2.1, 192.0.2.2','https://example.test','[2001:db8::1]:443'])assert.equal(build({CUSTOMER_IP:ip},session).ip,'198.51.100.20');});
+test('valid IP without fingerprint omits pair, keeps email/token, never invents UA',()=>{const x=build({CUSTOMER_IP:'198.51.100.20'},{attribution:{comet_token:'token'}});for(const k of ['ip','fingerprint','user_agent'])assert.equal(Object.hasOwn(x,k),false);assert.equal(x.comet_token,'token');});
+test('missing UA stays absent even with valid pair',()=>{const x=build({CUSTOMER_IP:'198.51.100.20'},{attribution:{comet_fingerprint:'fp'}});assert.equal(x.ip,'198.51.100.20');assert.equal(Object.hasOwn(x,'user_agent'),false);});
+function checkout(stored={},cookie='',query='') {let cookieValue=cookie,saved=stored,writes=0; const doc={};Object.defineProperty(doc,'cookie',{get(){return cookieValue},set(v){writes++;cookieValue=v.split(';')[0]}});const src=fs.readFileSync(new URL('../webflow/checkout-inline.js',import.meta.url),'utf8');const start=src.indexOf('function buildFbc('),end=src.indexOf('function getSelectedItems()',start);const c=vm.createContext({Date,Math,URLSearchParams,ATTRIBUTION_STORAGE_KEY:'fixture',getJson:()=>saved,clean:x=>String(x||'').trim(),getUrlParam:k=>new URLSearchParams(query).get(k)||'',getCookie:k=>k==='_fbc'?decodeURIComponent((cookieValue.match(/(?:^|;\s*)_fbc=([^;]*)/)||[])[1]||''):'fb.1.100.browser',setCookie:(k,v)=>{if(k==='_fbc'){writes++;cookieValue='_fbc='+encodeURIComponent(v)}},setJson:(k,v)=>saved=v,window:{location:{href:'https://example.test/checkout'}}});vm.runInContext(src.slice(start,end)+'\nthis.get=getAttributionData',c);return {get:()=>c.get(),stored:()=>saved,writes:()=>writes};}
+test('new click replaces stale fbc, then repeated calls preserve timestamp',()=>{const c=checkout({fbclid:'old',fbc:'fb.1.100.old'},'_fbc=fb.1.100.old','fbclid=new');const a=c.get(),b=c.get();assert.equal(a.fbclid,'new');assert.match(a.fbc,/^fb\.1\.\d+\.new$/);assert.equal(a.fbc,b.fbc);assert.equal(c.writes(),1);});
+test('matching cookie wins without timestamp rewrite',()=>{const c=checkout({fbc:'fb.1.99.same'},'_fbc=fb.1.100.same','fbclid=same');assert.equal(c.get().fbc,'fb.1.100.same');assert.equal(c.writes(),0);});
+test('stored landing click repairs checkout after URL parameters lost',()=>{const c=checkout({fbclid:'new',fbc:'fb.1.100.new'},'_fbc=fb.1.99.old');assert.equal(c.get().fbc,'fb.1.100.new');assert.equal(c.writes(),1);});
+test('no identifiers does not invent a click; malformed input ignored',()=>{for(const q of ['', 'fbclid=%7B%7Bad.id%7D%7D','fbclid=a%20b']){const c=checkout({},'',q);assert.equal(c.get().fbc,'');assert.equal(c.get().fbclid,'');}});
+test('cookie-only returning visitor retains existing click',()=>{const c=checkout({},'_fbc=fb.1.100.returning');assert.equal(c.get().fbc,'fb.1.100.returning');assert.equal(c.get().fbclid,'returning');});
+for (const page of ['sales','checkout']) test(page+' full bridge keeps new click consistent through session, preserves iframe and unrelated parameters',async()=>{
+const map=new Map([['fs_attribution_data',JSON.stringify({fbclid:'old',fbc:'fb.1.100.old',fbp:'fb.1.100.browser',gclid:'google-click'})]]), calls=[],timers=[];
+const storage={getItem:k=>map.get(k)||null,setItem:(k,v)=>map.set(k,v)};
+class Node {appendChild(child){child.isConnected=true;return child;}}
+const win={location:{origin:'https://flexiblest.com',pathname:'/secure-checkout',search:'?fbclid=new&comet_source=fb&comet_ad_id=123456',href:'https://flexiblest.com/secure-checkout'},localStorage:storage,sessionStorage:{getItem:()=>null},setInterval:f=>timers.push(f),fetch:async(u,i)=>{calls.push(JSON.parse(i.body));return{ok:true}}};
+const c=vm.createContext({window:win,document:{cookie:'_fbc=fb.1.100.old',referrer:'',documentElement:{}},Node,URL,URLSearchParams,Promise,Date,console});vm.runInContext(fs.readFileSync(new URL('../webflow/'+page+'-bridge.js',import.meta.url),'utf8'),c);
+const first=JSON.parse(map.get('fs_attribution_data'));assert.match(first.fbc,/\.new$/);await win.fetch('https://api.flexiblest.io/api/paypro-funnel-session',{body:JSON.stringify({action:'create'})});assert.equal(calls[0].attribution.fbc,first.fbc);assert.equal(calls[0].attribution.fbclid,'new');assert.equal(calls[0].attribution.gclid,'google-click');assert.equal(calls[0].attribution.fbp,'fb.1.100.browser');
+let src='https://store.payproglobal.com/checkout?products[1][id]=133559&x-fbc='+encodeURIComponent(first.fbc),writes=0;const frame={nodeType:1,tagName:'IFRAME',isConnected:false,getAttribute:()=>src,setAttribute:(k,v)=>{src=v;writes++}};new Node().appendChild(frame);new Node().appendChild(frame);assert.equal(writes,1);assert.equal(new URL(src).searchParams.get('x-fbc'),first.fbc);
+});
+test('identical resolver in both bridges and checkout prevents divergent click rules',()=>{const extract=name=>{const s=fs.readFileSync(new URL('../webflow/'+name,import.meta.url),'utf8');return s.slice(s.indexOf('function resolveFacebookClick('),s.indexOf('\n  }',s.indexOf('function resolveFacebookClick('))+4)};assert.equal(extract('sales-bridge.js'),extract('checkout-bridge.js'));assert.equal(extract('sales-bridge.js'),extract('checkout-inline.js'));});
+test('blocked persistent storage does not continually regenerate the click timestamp',()=>{
+const src=fs.readFileSync(new URL('../webflow/sales-bridge.js',import.meta.url),'utf8');const start=src.indexOf('function resolveFacebookClick('),end=src.indexOf('\n  }',start)+4;let now=100;
+const c=vm.createContext({Date:{now:()=>now++}});vm.runInContext(src.slice(start,end)+'\nthis.resolve=resolveFacebookClick',c);
+assert.equal(c.resolve('click','','','').fbc,'fb.1.100.click');assert.equal(c.resolve('click','','','').fbc,'fb.1.100.click');assert.equal(c.resolve('new','','','').fbc,'fb.1.101.new');assert.equal(c.resolve('new','','fb.1.90.new','').fbc,'fb.1.90.new');
+});
+test('blocked cookie/localStorage access does not prevent session request',async()=>{
+class Node{appendChild(x){return x}}let request;
+const win={location:{origin:'https://flexiblest.com',pathname:'/secure-checkout',search:'?fbclid=click',href:'https://flexiblest.com/secure-checkout'},localStorage:{getItem(){throw Error('blocked')},setItem(){throw Error('blocked')}},sessionStorage:{getItem(){throw Error('blocked')}},setInterval:()=>{},fetch:async(u,i)=>{request=JSON.parse(i.body);return {ok:true}}};const doc={referrer:'',documentElement:{}};Object.defineProperty(doc,'cookie',{get(){throw Error('blocked')}});
+const c=vm.createContext({window:win,document:doc,Node,URL,URLSearchParams,Promise,Date,console});vm.runInContext(fs.readFileSync(new URL('../webflow/checkout-bridge.js',import.meta.url),'utf8'),c);await win.fetch('https://api.flexiblest.io/api/paypro-funnel-session',{body:JSON.stringify({action:'create'})});assert.match(request.attribution.fbc,/\.click$/);
+});
+test('newer cookie on return visit is not overwritten by an older coherent stored pair',()=>{const c=checkout({fbclid:'old',fbc:'fb.1.100.old'},'_fbc=fb.1.200.new');assert.equal(c.get().fbclid,'new');assert.equal(c.get().fbc,'fb.1.200.new');assert.equal(c.writes(),0);});
