@@ -1,4 +1,5 @@
 import crypto from "crypto";
+import { getBrowserRequestIp } from "../lib/visitor-ip.js";
 
 const SESSION_TTL_SECONDS = 72 * 60 * 60;
 const MAX_REQUEST_BODY_BYTES = 32 * 1024;
@@ -267,16 +268,6 @@ function parseRequestBody(req) {
   return body;
 }
 
-function getRequestIp(req) {
-  const forwarded =
-    req.headers["x-vercel-forwarded-for"] ||
-    req.headers["x-forwarded-for"] ||
-    req.headers["x-real-ip"] ||
-    "";
-
-  return clean(String(forwarded).split(",")[0], 100);
-}
-
 function cleanPageUrl(value) {
   const input = clean(value, 4000);
 
@@ -397,8 +388,10 @@ function sanitizeAttribution(body) {
 }
 
 function getRequestContext(req, body) {
+  const visitor = getBrowserRequestIp(req.headers);
   return {
-    ip_address: getRequestIp(req),
+    ip_address: visitor.ip,
+    ip_source: visitor.source,
     user_agent: clean(req.headers["user-agent"], 1500),
     accept_language: clean(req.headers["accept-language"], 500),
     page_url: cleanPageUrl(

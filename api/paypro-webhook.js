@@ -1,4 +1,4 @@
-import { isIP } from "node:net";
+import { selectVisitorIp } from "../lib/visitor-ip.js";
 import {
   createHash,
   timingSafeEqual
@@ -607,16 +607,6 @@ function cleanPageUrl(value) {
   } catch {
     return "";
   }
-}
-
-function getRequestIp(req) {
-  const forwarded =
-    req.headers["x-vercel-forwarded-for"] ||
-    req.headers["x-forwarded-for"] ||
-    req.headers["x-real-ip"] ||
-    "";
-
-  return clean(String(forwarded).split(",")[0], 100);
 }
 
 function isTestMode(data) {
@@ -1448,10 +1438,10 @@ function buildCometlyEvent(data, req, session, kind) {
     ? `paypro-${orderId}-${productId}`
     : `paypro-${orderId}-purchase`;
 
-  const visitorIp = [
+  const visitorIp = selectVisitorIp(
     pick(data, ["CUSTOMER_IP"], 100),
-    clean(requestContext.ip_address, 100)
-  ].find(value => isIP(value)) || "";
+    requestContext.ip_address
+  ).ip;
   const visitorUserAgent = clean(requestContext.user_agent, 1500);
 
   const firstName =
@@ -2322,6 +2312,10 @@ async function purchaseHandler(req, res) {
       has_comet_token: Boolean(event.comet_token),
       has_fingerprint: Boolean(event.fingerprint),
       has_ip: Boolean(event.ip),
+      ip_source: event.ip ? selectVisitorIp(
+        pick(data, ["CUSTOMER_IP"], 100),
+        authorization.session?.request_context?.ip_address
+      ).source : "none",
       has_user_agent: Boolean(event.user_agent),
       url: event.url
     });
