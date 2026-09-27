@@ -183,34 +183,42 @@ return cjson.encode(session)
 `;
 
 const CONFIRM_CHARGE_RESULT_SCRIPT = `
-local raw = redis.call("GET", KEYS[1])
-
-if raw then
-  local ok, existing = pcall(cjson.decode, raw)
-
-  if ok and type(existing) == "table" and
-     existing["charged"] == true then
-    return cjson.encode({
-      outcome = "existing",
-      record = existing
-    })
+local incoming = cjson.decode(ARGV[1])
+if incoming["openai_job"] and redis.pcall("EXISTS", "paypro:openai:v1:revoked:" .. tostring(incoming["referencedOrderId"])) ~= 0 then
+  incoming["openai_job"] = nil
+end
+local function journal(record)
+  local job = record["openai_job"]
+  if type(job) ~= "table" then return end
+  local prefix = "paypro:openai:v1:"
+  local id = tostring(record["orderId"])
+  local root = tostring(record["referencedOrderId"])
+  if redis.pcall("EXISTS", prefix .. "done:" .. id) ~= 0 or
+     redis.pcall("EXISTS", prefix .. "revoked:" .. root) ~= 0 then return end
+  local stored = redis.pcall("SET", prefix .. "job:" .. id, cjson.encode(job), "NX", "EX", 604800)
+  if type(stored) ~= "table" or not stored.err then
+    redis.pcall("ZADD", prefix .. "due", "NX", 0, id)
   end
 end
-
-local record = cjson.decode(ARGV[1])
-
-redis.call(
-  "SET",
-  KEYS[1],
-  ARGV[1],
-  "EX",
-  ARGV[2]
-)
-
-return cjson.encode({
-  outcome = "saved",
-  record = record
-})
+local raw = redis.call("GET", KEYS[1])
+if raw then
+  local ok, existing = pcall(cjson.decode, raw)
+  if ok and type(existing) == "table" and existing["charged"] == true then
+    -- A reference-charge API result can arrive before its signed IPN. Enrich
+    -- only the same confirmed order; never journal an accidental second charge.
+    if tostring(existing["orderId"]) == tostring(incoming["orderId"]) then
+      if not existing["openai_job"] and incoming["openai_job"] then
+        existing["openai_job"] = incoming["openai_job"]
+        redis.call("SET", KEYS[1], cjson.encode(existing), "KEEPTTL")
+      end
+      journal(existing)
+    end
+    return cjson.encode({outcome = "existing", record = existing})
+  end
+end
+redis.call("SET", KEYS[1], cjson.encode(incoming), "EX", ARGV[2])
+journal(incoming)
+return cjson.encode({outcome = "saved", record = incoming})
 `;
 
 function clean(value, maxLength = 2000) {
@@ -1152,6 +1160,27 @@ async function persistUpsellChargeResult(
 
   if (authorization.manualFallback === true) {
     record.manualFallback = true;
+  }
+
+  // Only signed, authorized, explicitly live charge IPNs can create this
+  // snapshot. No guessed amount/time from the recovery record is forwarded.
+  if (data.ORDER_STATUS === "Processed" && data.IPN_TYPE_NAME === "OrderCharged" &&
+      ["0", "false"].includes(String(data.TEST_MODE)) &&
+      authorization.session.openai?.allowed === true &&
+      /^\d+$/.test(referencedOrderId) && orderId !== referencedOrderId) {
+    record.openai_job = {
+      kind: "upsell",
+      payment: Object.fromEntries([
+        "ORDER_ID", "PRODUCT_ID", "ORDER_STATUS", "IPN_TYPE_NAME", "TEST_MODE",
+        "ORDER_TOTAL_AMOUNT", "ORDER_CURRENCY_CODE", "ORDER_PLACED_TIME_UTC", "CUSTOMER_EMAIL"
+      ].map(key => [key, String(data[key] ?? "")])),
+      session: {
+        paypro_root_order_id: referencedOrderId,
+        openai: authorization.session.openai,
+        request_context: authorization.session.request_context
+      },
+      attempts: 0
+    };
   }
 
   const confirmationResult = parseStoredRecord(

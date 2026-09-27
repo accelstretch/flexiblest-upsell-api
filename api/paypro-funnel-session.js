@@ -577,6 +577,20 @@ if s.paypro_root_order_id then
  redis.call('SET',prefix .. 'revoked:' .. s.paypro_root_order_id,'1','EX',604800)
  redis.call('DEL',prefix .. 'job:' .. s.paypro_root_order_id)
  redis.call('ZREM',prefix .. 'due',s.paypro_root_order_id)
+ for _,offer in ipairs({'fasttrack57','fasttrack37'}) do
+  local chargeKey='paypro:charge-result:' .. s.fs_session_id .. ':' .. offer
+  local chargeRaw=redis.pcall('GET',chargeKey)
+  if type(chargeRaw) == 'string' then
+   local ok,charge=pcall(cjson.decode,chargeRaw)
+   if ok and type(charge) == 'table' and charge.openai_job then
+    local order=tostring(charge.orderId)
+    charge.openai_job=nil
+    redis.pcall('SET',chargeKey,cjson.encode(charge),'KEEPTTL')
+    redis.pcall('DEL',prefix .. 'job:' .. order)
+    redis.pcall('ZREM',prefix .. 'due',order)
+   end
+  end
+ end
 end
 return 1`, "1", funnelSessionKey(id), intent, hashAccessToken(token)]);
   if (result !== 1) throw new ClientError(401, "Invalid funnel session credentials.");
