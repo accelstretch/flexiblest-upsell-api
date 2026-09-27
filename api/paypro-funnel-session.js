@@ -1,3 +1,4 @@
+import { sanitizeOpenAI } from "../lib/openai-conversions.js";
 import crypto from "crypto";
 import { getBrowserRequestIp } from "../lib/visitor-ip.js";
 
@@ -453,6 +454,7 @@ async function createFunnelSession(req, body) {
       amount: null,
 
       attribution,
+      openai: sanitizeOpenAI(body.openai),
       request_context: requestContext,
 
       created_at: createdAt,
@@ -537,6 +539,11 @@ if ARGV[6] ~= "" and ARGV[6] ~= "{}" then
   end
 end
 
+if ARGV[10] and ARGV[10] ~= "null" then
+  local openaiOk, openai = pcall(cjson.decode, ARGV[10])
+  if openaiOk and type(openai) == "table" then session["openai"] = openai end
+end
+
 session["updated_at"] = ARGV[7]
 session["expires_at"] = ARGV[8]
 
@@ -550,6 +557,30 @@ redis.call(
 
 return "OK"
 `;
+
+// Explicit OpenAI-only withdrawal remains possible after payment; it cannot
+// change customer identity, payment state, or existing provider attribution.
+async function revokeOpenAI(req, body) {
+  const id = clean(body.fs_session_id, 160), intent = clean(body.fs_checkout_intent_id, 160);
+  const token = getBearerToken(req);
+  if (!validIdentifier(id) || !validIdentifier(intent) || !token || token.length > 500) throw new ClientError(401, "Invalid funnel session credentials.");
+  const result = await redisCommand(["EVAL", `
+local raw=redis.call('GET',KEYS[1])
+if not raw then return 0 end
+local s=cjson.decode(raw)
+if s.fs_checkout_intent_id ~= ARGV[1] or s.access_token_hash ~= ARGV[2] then return 0 end
+s.openai={allowed=false}
+s.openai_payment=nil
+redis.call('SET',KEYS[1],cjson.encode(s),'KEEPTTL')
+if s.paypro_root_order_id then
+ local prefix='paypro:openai:v1:'
+ redis.call('SET',prefix .. 'revoked:' .. s.paypro_root_order_id,'1','EX',604800)
+ redis.call('DEL',prefix .. 'job:' .. s.paypro_root_order_id)
+ redis.call('ZREM',prefix .. 'due',s.paypro_root_order_id)
+end
+return 1`, "1", funnelSessionKey(id), intent, hashAccessToken(token)]);
+  if (result !== 1) throw new ClientError(401, "Invalid funnel session credentials.");
+}
 
 async function saveCheckoutEmail(req, body, attributionOnly = false) {
   const sessionId = clean(body.fs_session_id, 160);
@@ -640,7 +671,8 @@ async function saveCheckoutEmail(req, body, attributionOnly = false) {
     JSON.stringify(attribution),
     updatedAt,
     expiresAt,
-    String(SESSION_TTL_SECONDS)
+    String(SESSION_TTL_SECONDS),
+    JSON.stringify(sanitizeOpenAI(body.openai))
   ]);
 
   if (result === "COMPLETED") {
@@ -702,6 +734,11 @@ export default async function handler(req, res) {
         ok: true,
         ...result
       });
+    }
+
+    if (action === "revoke_openai") {
+      await revokeOpenAI(req, body);
+      return sendJson(res, 200, { ok: true });
     }
 
     if (action === "save_attribution") {

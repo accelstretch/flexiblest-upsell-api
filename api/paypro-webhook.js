@@ -149,6 +149,12 @@ if tostring(session["paid_at"] or "") == "" then
   session["paid_at"] = ARGV[13]
 end
 
+-- Only a main, authenticated IPN reaches this script. Keep the original raw
+-- payment facts; the isolated worker applies stricter OpenAI eligibility.
+if ARGV[17] and not session["openai_payment"] and type(session["openai"]) == "table" then
+  local paymentOk, payment = pcall(cjson.decode, ARGV[17])
+  if paymentOk and type(payment) == "table" then session["openai_payment"] = payment end
+end
 session["updated_at"] = ARGV[14]
 session["expires_at"] = ARGV[15]
 
@@ -160,6 +166,19 @@ redis.call(
   ARGV[16]
 )
 
+-- Best-effort secondary journal cannot fail or change PayPro/Cometly behavior.
+-- The paid session above retains a recovery copy if either secondary write fails.
+if session["openai_payment"] and session["openai"]["allowed"] == true then
+  local id = ARGV[3]
+  local prefix = "paypro:openai:v1:"
+  local job = cjson.encode({payment=session["openai_payment"], session={
+    paypro_root_order_id=id, openai=session["openai"], request_context=session["request_context"]
+  }, attempts=0})
+  local stored = redis.pcall("SET", prefix .. "job:" .. id, job, "NX", "EX", 604800)
+  if type(stored) ~= "table" or not stored.err then
+    redis.pcall("ZADD", prefix .. "due", "NX", 0, id)
+  end
+end
 return cjson.encode(session)
 `;
 
@@ -856,7 +875,11 @@ async function persistMainCheckout(data) {
     paidAt,
     updatedAt,
     expiresAt,
-    String(SESSION_TTL_SECONDS)
+    String(SESSION_TTL_SECONDS),
+    JSON.stringify(Object.fromEntries([
+      "ORDER_ID", "PRODUCT_ID", "ORDER_STATUS", "IPN_TYPE_NAME", "TEST_MODE",
+      "ORDER_TOTAL_AMOUNT", "ORDER_CURRENCY_CODE", "ORDER_PLACED_TIME_UTC", "CUSTOMER_EMAIL"
+    ].map(key => [key, typeof data[key] === "string" ? data[key] : String(data[key] ?? "") ])))
   ]);
 
   const rejectionReasons = new Set([

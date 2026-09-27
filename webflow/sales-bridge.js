@@ -1,3 +1,66 @@
+/* OpenAI attribution only. No events, SDK, polling, or payment navigation. */
+(function () {
+  "use strict";
+  var KEY = "fs_openai_attribution_v1", MAX_AGE = 30 * 86400000;
+  var memory = null, landing = true;
+  function opaque(value) {
+    return typeof value === "string" && value.length > 0 && value.length <= 4096 && !/[\s\u0000-\u001f\u007f]/.test(value) ? value : "";
+  }
+  function cookie(name) {
+    try {
+      var part = document.cookie.split(";").map(function (v) { return v.trim(); }).filter(function (v) { return v.indexOf(name + "=") === 0; })[0];
+      return part ? decodeURIComponent(part.slice(name.length + 1)) : "";
+    } catch (_) { return ""; }
+  }
+  function denied() {
+    try { if (window.localStorage.getItem("oaiq_consent") === "false") return true; } catch (_) {}
+    if (cookie("__oaiq_consent") === "false") return true;
+    // Also respect consent commands queued before the installed SDK is ready.
+    var q = window.oaiq && window.oaiq.q, latest;
+    if (Array.isArray(q)) q.forEach(function (a) { if(a[0] === "consent") latest = a[1]; });
+    return latest === false || window.fsOpenAIMeasurementAllowed === false;
+  }
+  window.fsGetOpenAIAttribution = function () {
+    if (denied()) {
+      memory = null;
+      try { window.localStorage.removeItem(KEY); } catch (_) {}
+      return { allowed: false };
+    }
+    var now = Date.now(), stored = memory;
+    if (!stored) { try { stored = JSON.parse(window.localStorage.getItem(KEY)); } catch (_) {} }
+    if (!stored || !opaque(stored.oppref) || !(stored.captured_at >= now - MAX_AGE && stored.captured_at <= now)) stored = {};
+    var current = landing ? opaque(new URLSearchParams(window.location.search).get("oppref")) : "";
+    landing = false;
+    var fromCookie = opaque(cookie("__oppref"));
+    // A URL click wins over an older cookie while SDK initialization catches up.
+    if (current) stored = {oppref: current, captured_at: now};
+    else if (!stored.oppref && fromCookie) stored = {oppref: fromCookie, captured_at: now};
+    var next = {allowed:true};
+    if (stored.oppref) { next.oppref = stored.oppref; next.captured_at = stored.captured_at; }
+    var obref = opaque(cookie("__obref"));
+    if (obref) next.obref = obref;
+    memory = stored;
+    var serialized = JSON.stringify(stored);
+    try { if (window.localStorage.getItem(KEY) !== serialized) window.localStorage.setItem(KEY, serialized); } catch (_) {}
+    return next;
+  };
+  window.fsGetOpenAIAttribution();
+  // First-party navigation fallback when local storage is unavailable.
+  if (typeof document.addEventListener === "function") document.addEventListener("click", function (event) {
+    var anchor = event.target && event.target.closest && event.target.closest("a[href]");
+    if (!anchor) return;
+    try {
+      var url = new URL(anchor.href, window.location.href);
+      if (url.origin !== window.location.origin || !/^\/secure-checkout\/?$/.test(url.pathname)) return;
+      var attribution = window.fsGetOpenAIAttribution();
+      if (attribution.allowed && attribution.oppref) {
+        url.searchParams.set("oppref", attribution.oppref);
+        anchor.href = url.toString();
+      }
+    } catch (_) {}
+  }, true);
+})();
+
 /* FLEXIBLEST ATTRIBUTION BRIDGE v2: separate ad and visitor identifiers */
 (function () {
   "use strict";
@@ -235,22 +298,23 @@
     // Late pixel readiness must not reload a payment form already in use.
     // Save to the same authenticated session that all purchase/upsell IPNs use.
     if (window.location.pathname !== "/secure-checkout" || savePending || Date.now() < retryAfter) return;
-    if (!attribution.comet_token && !attribution.comet_fingerprint) return;
+    var openai = window.fsGetOpenAIAttribution();
+    if (!attribution.comet_token && !attribution.comet_fingerprint && !openai) return;
     try {
       var sessionId = window.sessionStorage.getItem("fs_session_id");
       var intentId = window.sessionStorage.getItem("fs_checkout_intent_id");
       var accessToken = window.sessionStorage.getItem("fs_funnel_access_token");
-      if (!sessionId || !intentId || !accessToken || sessionId === completedSession) return;
+      if (!sessionId || !intentId || !accessToken || (sessionId === completedSession && openai.allowed !== false)) return;
       var identity = {};
       DATA_KEYS.forEach(function(key) { if (attribution[key]) identity[key] = attribution[key]; });
-      var signature = sessionId + JSON.stringify(identity);
+      var signature = sessionId + JSON.stringify(identity) + JSON.stringify(openai);
       if (signature === lastSavedAttribution || typeof nativeFetch !== "function") return;
       savePending = true;
       nativeFetch.call(window, FUNNEL_SESSION_URL, {
         method: "POST", mode: "cors", credentials: "omit", cache: "no-store", keepalive: true,
         headers: { "Content-Type": "application/json", Authorization: "Bearer " + accessToken },
-        body: JSON.stringify({ action: "save_attribution", fs_session_id: sessionId,
-          fs_checkout_intent_id: intentId, attribution: identity })
+        body: JSON.stringify({ action: openai.allowed === false && sessionId === completedSession ? "revoke_openai" : "save_attribution", fs_session_id: sessionId,
+          fs_checkout_intent_id: intentId, attribution: identity, openai: openai })
       }).then(function(response) {
         if (response.ok) lastSavedAttribution = signature;
         if (response.status === 409) completedSession = sessionId;
@@ -268,6 +332,7 @@
 
     attribution = captureAttribution();
     var next = Object.assign({}, body);
+    next.openai = window.fsGetOpenAIAttribution();
     next.attribution = Object.assign(
       {},
       safeContext(body.attribution || body.attribution_data),
