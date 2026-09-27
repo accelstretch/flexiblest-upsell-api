@@ -1,3 +1,4 @@
+import {sanitizeOpenAI} from '../lib/openai-conversions.js';
 import assert from 'node:assert/strict';
 import {test} from 'node:test';
 import fs from 'node:fs';
@@ -6,7 +7,7 @@ import crypto from 'node:crypto';
 import {selectVisitorIp, getBrowserRequestIp} from '../lib/visitor-ip.js';
 function load(path, names, overrides={}) {
  const code=fs.readFileSync(new URL(path,import.meta.url),'utf8').replace(/import\s+[\s\S]*?from\s+['"][^'"]+['"];?/g,'').replace(/export default /g,'');
- const ctx=vm.createContext({process,URL,Buffer,console,crypto,selectVisitorIp,getBrowserRequestIp,...crypto,...overrides});
+ const ctx=vm.createContext({process,URL,Buffer,console,crypto,sanitizeOpenAI,selectVisitorIp,getBrowserRequestIp,...crypto,...overrides});
  vm.runInContext(code+'\nthis.exposed={'+names.join(',')+'}',ctx);
  return ctx.exposed;
 }

@@ -1,0 +1,4 @@
+{
+  "crons": [{"path": "/api/openai-conversions-worker", "schedule": "*/5 * * * *"}],
+  "functions": {"api/openai-conversions-worker.js": {"maxDuration": 300}}
+}
