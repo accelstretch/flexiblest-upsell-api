@@ -41,3 +41,15 @@ test('protected diagnostic forces validate_only and sends no customer informatio
   await handler({method:'GET',headers:{authorization:'Bearer fixturé'},query:{}},res);assert.equal(res.code,401);
  }finally{globalThis.fetch=oldFetch;for(const k of ['CRON_SECRET','OPENAI_CONVERSIONS_API_KEY','OPENAI_ADS_PIXEL_ID']){if(before[k]===undefined)delete process.env[k];else process.env[k]=before[k];}}
 });
+
+for (const [product,amount,path] of [['133573','57.00','complete-upgrade'],['133574','37.00','final-offer']]) {
+ test('confirmed upgrade '+product+' has separate purchase ID and original attribution',()=>{
+  const r=record();r.kind='upsell';r.payment.PRODUCT_ID=product;r.payment.ORDER_ID='67890';r.payment.ORDER_TOTAL_AMOUNT=amount;
+  const e=buildOpenAIEvent(r,now);assert.equal(e.id,'paypro-67890-purchase');assert.equal(e.data.amount,Number(amount)*100);assert.equal(e.oppref,r.session.openai.oppref);assert.equal(e.user.obref,r.session.openai.obref);assert.equal(e.source_url,'https://flexiblest.com/'+path);
+  r.payment.ORDER_ID=r.session.paypro_root_order_id;assert.equal(buildOpenAIEvent(r,now),null);
+ });
+}
+test('upsell kind cannot turn a main charge, bump, unknown offer or test into a purchase',()=>{
+ for(const product of ['133559','133565','133569','133575','unknown']){const r=record();r.kind='upsell';r.payment.ORDER_ID='67890';r.payment.PRODUCT_ID=product;assert.equal(buildOpenAIEvent(r,now),null);}
+ for(const mode of ['1','true','']){const r=record();r.kind='upsell';r.payment.ORDER_ID='67890';r.payment.PRODUCT_ID='133573';r.payment.TEST_MODE=mode;assert.equal(buildOpenAIEvent(r,now),null);}
+});
