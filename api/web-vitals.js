@@ -14,7 +14,7 @@ const ALLOWED_METRICS = new Set([
 ]);
 const ALLOWED_DEVICES = new Set(["mobile", "tablet", "desktop", "unknown"]);
 const ALLOWED_SOURCES = new Set(["facebook", "instagram", "meta", "other", "direct", "unknown"]);
-const ALLOWED_PATHS = new Set(["/accelstretch", "/secure-checkout"]);
+const ALLOWED_PATHS = new Set(["/accelstretch", "/accelstretch-method", "/accelstretch-system", "/secure-checkout"]);
 
 function clean(value, maxLength = 200) {
   return String(value ?? "")
