@@ -1,7 +1,7 @@
 const SCRIPT = `(() => {
   "use strict";
 
-  const PATHS = new Set(["/accelstretch", "/secure-checkout"]);
+  const PATHS = new Set(["/accelstretch", "/accelstretch-method", "/accelstretch-system", "/secure-checkout"]);
   if (!PATHS.has(location.pathname)) return;
 
   const ENDPOINT = "https://api.flexiblest.io/api/web-vitals";
@@ -65,7 +65,7 @@ const SCRIPT = `(() => {
 
   if (!sampled) return;
 
-  if (forced && location.pathname === "/accelstretch") {
+  if (forced && location.pathname !== "/secure-checkout") {
     function preserveForcedTestOnCheckout(event) {
       const link = event.target?.closest?.('a[href]');
       if (!link) return;
