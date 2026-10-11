@@ -1299,6 +1299,8 @@ function getAttributionValue(session, data, keys) {
     }
   }
 
+  if (attribution.fs_touch_id && keys.some(key=> /^(comet_source|comet_network|comet_campaign|comet_ad_group|comet_keyword|comet_ad_id|comet_placement|site_source_name|ad_id|placement|campaign_id|adset_id|utm_|fbclid|fbc|gclid|gbraid|wbraid|ttclid)/.test(key))) return "";
+
   const payProKeys = [];
 
   keys.forEach((key) => {
@@ -1462,8 +1464,8 @@ function buildCometlyEvent(data, req, session, kind) {
   const adCandidates = [
     session?.attribution?.comet_ad_id,
     session?.attribution?.ad_id,
-    pick(data, ["x-comet_ad_id", "comet_ad_id"], 300),
-    pick(data, ["x-ad_id", "ad_id"], 300)
+    session?.attribution?.fs_touch_id ? "" : pick(data, ["x-comet_ad_id", "comet_ad_id"], 300),
+    session?.attribution?.fs_touch_id ? "" : pick(data, ["x-ad_id", "ad_id"], 300)
   ].map(value => clean(value, 300));
   const cometAdId = adCandidates.find(value =>
     value && value !== fbclid && value !== fbc && value !== fbp &&
@@ -1563,11 +1565,11 @@ function buildCometlyEvent(data, req, session, kind) {
 
     comet_source: cometSource,
     comet_network: cometSource,
-    comet_campaign: utmCampaign,
-    comet_ad_group: utmContent,
+    comet_campaign: getAttributionValue(session,data,["comet_campaign","campaign_id"]) || utmCampaign,
+    comet_ad_group: getAttributionValue(session,data,["comet_ad_group","adset_id"]),
     comet_ad_id: cometAdId,
     comet_placement: cometPlacement,
-    comet_keyword: utmTerm,
+    comet_keyword: getAttributionValue(session,data,["comet_keyword"]) || (metaSource ? "" : utmTerm),
     comet_type: utmMedium,
 
     profile_field_1: "paypro",
@@ -2092,7 +2094,8 @@ function sendSkipped(res, reason, extra = {}) {
   });
 }
 
-async function purchaseHandler(req, res) {
+const VERIFIED_ORDER_API = Symbol('verified PayPro order API');
+async function purchaseHandler(req, res, authority) {
   res.setHeader(
     "Cache-Control",
     "no-store, max-age=0"
@@ -2117,7 +2120,7 @@ async function purchaseHandler(req, res) {
       buildSafeLog(data)
     );
 
-    if (!verifyPayProSignature(data)) {
+    if (authority !== VERIFIED_ORDER_API && !verifyPayProSignature(data)) {
       console.error(
         "PAYPRO WEBHOOK SIGNATURE REJECTED",
         {
@@ -2418,7 +2421,78 @@ async function purchaseHandler(req, res) {
 }
 
 // Financial reporting runs only after the original authenticated order handler.
-import { withFinancials } from '../lib/paypro-financials.js';
+import { withFinancials, getOrder } from '../lib/paypro-financials.js';
+import { enqueueSigned, processJob, responseBuffer } from '../lib/paypro-recovery.js';
+export async function processSignedNotification(data) {
+  const buffered=responseBuffer();
+  await withFinancials(purchaseHandler,{method:'POST',headers:{},body:data},buffered);
+  return buffered;
+}
+// Only an authenticated server-side API read can reach this path. There is no
+// HTTP flag/header that bypasses signature checks and no fabricated signature.
+export async function reconcilePaidOrder(orderId, notBefore, {readOrder=getOrder, audit=false, now=Date.now, deadline=Infinity}={}) {
+  const order=await readOrder(orderId);
+  if(String(order.orderId)!==String(orderId)) throw new Error('recovery_order_id_mismatch');
+  const date=String(order.createdAt||'');
+  const created=Date.parse(/(?:Z|[+-]\d\d:\d\d)$/.test(date)?date:date+'Z');
+  if(order.isTestMode!==false || order.orderStatusId!==5 ||
+     !Number.isFinite(created) || created<notBefore || created>now()-300000 ||
+     Number(order.billingRefundedAmount)!==0 || !Array.isArray(order.orderItems) || !order.orderItems.length)
+    return {skipped:true};
+  if(order.orderItems.some(i=>!KAJABI_PRODUCT_OFFERS[String(i.productId)] ||
+     String(i.vendorAccountId)!==String(process.env.PAYPRO_VENDOR_ACCOUNT_ID) ||
+     String(i.orderId)!==String(orderId) || !/^\d+$/.test(String(i.orderItemId))))
+    throw new Error('recovery_order_items_unverified');
+  const total=Number(order.billingTotalPrice)+Number(order.billingTotalTaxes);
+  if(!Number.isFinite(total)||total<=0||!/^[A-Z]{3}$/.test(order.billingCurrencyCode||''))
+    throw new Error('recovery_order_amount_unverified');
+  // PayPro documents both a dictionary and an array of key/value records.
+  const custom=order.customFields;
+  const entries=Array.isArray(custom) ? custom.map(f=>[f?.customFieldKey,f?.customFieldValue]) :
+    custom && typeof custom==='object' ? Object.entries(custom) : null;
+  if(!entries || entries.some(([k,v])=>typeof k!=='string'||typeof v!=='string') ||
+     new Set(entries.map(([k])=>k)).size!==entries.length)
+    throw new Error('recovery_custom_fields_unverified');
+  const metadata=Object.fromEntries(entries.filter(([k])=>k.startsWith('x-')));
+  if(!metadata['x-fs_session_id'] || !metadata['x-fs_checkout_intent_id'])
+    throw new Error('recovery_session_metadata_missing');
+  if(audit) return {audit:true,items:order.orderItems.length,custom_fields_shape:Array.isArray(custom)?'array':'dictionary',session_metadata:true};
+  const results=[];
+  // Main first: establish the paid session before a later upsell is handled.
+  for(const item of [...order.orderItems].sort((a,b)=>Number(String(b.productId)==='133559')-Number(String(a.productId)==='133559'))) {
+    if(now()>deadline)throw new Error('recovery_time_budget');
+    const data={...metadata,ORDER_ID:String(orderId),ORDER_ITEM_ID:String(item.orderItemId),
+      PRODUCT_ID:String(item.productId),ORDER_STATUS:'Processed',IPN_TYPE_NAME:'OrderCharged',TEST_MODE:'0',
+      ORDER_TOTAL_AMOUNT:String(total),ORDER_CURRENCY_CODE:order.billingCurrencyCode,
+      ORDER_PLACED_TIME_UTC:new Date(created).toISOString(),ORDER_ITEM_NAME:String(item.orderItemName||''),
+      CUSTOMER_EMAIL:String(order.customer?.email||''),CUSTOMER_FIRST_NAME:String(order.customer?.firstName||''),
+      CUSTOMER_LAST_NAME:String(order.customer?.lastName||''),CUSTOMER_PHONE:String(order.customer?.phone||'')};
+    const buffered=responseBuffer();
+    await withFinancials((req,res)=>purchaseHandler(req,res,VERIFIED_ORDER_API),{method:'POST',headers:{},body:data},buffered);
+    results.push(buffered);
+  }
+  return {results};
+}
 export default async function handler(req, res) {
+  // Keep existing behavior available for rollback and all non-charge events.
+  // The queue is production-only; preview tests cannot enqueue real work.
+  if(process.env.VERCEL_ENV==='production' && process.env.PAYPRO_QUEUE_DISABLED!=='1' && req.method==='POST') {
+    try {
+      const data=mergePayProData(req.body);
+      if(!verifyPayProSignature(data)) return res.status(401).json({ok:false,error:'Invalid PayPro signature'});
+      if(pick(data,['IPN_TYPE_NAME'],200).toLowerCase()==='ordercharged' && !isTestMode(data)) {
+        const id=await enqueueSigned(data);
+        let output;
+        await processJob(id,async stored=>{output=await processSignedNotification(stored);return output;});
+        if(output) {
+          for(const [k,v] of Object.entries(output.headers)) res.setHeader(k,v);
+          return res.status(output.code).json(output.body);
+        }
+        return res.status(200).json({ok:true,durably_accepted:true});
+      }
+    } catch {
+      return res.status(503).json({ok:false,retry_required:true});
+    }
+  }
   return withFinancials(purchaseHandler, req, res);
 }

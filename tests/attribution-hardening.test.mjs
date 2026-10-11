@@ -6,7 +6,7 @@ import crypto from 'node:crypto';
 import {selectVisitorIp, getBrowserRequestIp} from '../lib/visitor-ip.js';
 const raw=fs.readFileSync(new URL('../api/paypro-webhook.js',import.meta.url),'utf8');
 const ctx=vm.createContext({process:{env:{}},URL,Buffer,console,crypto,...crypto,selectVisitorIp,getBrowserRequestIp});
-vm.runInContext(raw.replace(/import\s+[\s\S]*?from\s+['"][^'"]+['"];?/g,'').replace(/export default /g,'')+'\nthis.build=buildCometlyEvent',ctx);
+vm.runInContext(raw.replace(/import\s+[\s\S]*?from\s+['"][^'"]+['"];?/g,'').replace(/export default /g,'').replace(/export (?=async function|function|const)/g,'')+'\nthis.build=buildCometlyEvent',ctx);
 const data={CUSTOMER_EMAIL:'fixture@example.test',ORDER_ID:'90000001',PRODUCT_ID:'133559',ORDER_TOTAL_AMOUNT:'29',ORDER_CURRENCY_CODE:'USD',ORDER_PLACED_TIME_UTC:'2026-09-24T00:00:00Z'};
 const req={headers:{'x-vercel-forwarded-for':'192.0.2.99','user-agent':'WebhookSender/1'}};
 const build=(d={},s={})=>ctx.build({...data,...d},req,s,'main');
@@ -28,10 +28,10 @@ const storage={getItem:k=>map.get(k)||null,setItem:(k,v)=>map.set(k,v)};
 class Node {appendChild(child){child.isConnected=true;return child;}}
 const win={location:{origin:'https://flexiblest.com',pathname:'/secure-checkout',search:'?fbclid=new&comet_source=fb&comet_ad_id=123456',href:'https://flexiblest.com/secure-checkout'},localStorage:storage,sessionStorage:{getItem:()=>null},setInterval:f=>timers.push(f),fetch:async(u,i)=>{calls.push(JSON.parse(i.body));return{ok:true}}};
 const c=vm.createContext({window:win,document:{cookie:'_fbc=fb.1.100.old',referrer:'',documentElement:{}},Node,URL,URLSearchParams,Promise,Date,console});vm.runInContext(fs.readFileSync(new URL('../webflow/'+page+'-bridge.js',import.meta.url),'utf8'),c);
-const first=JSON.parse(map.get('fs_attribution_data'));assert.match(first.fbc,/\.new$/);await win.fetch('https://api.flexiblest.io/api/paypro-funnel-session',{body:JSON.stringify({action:'create'})});assert.equal(calls[0].attribution.fbc,first.fbc);assert.equal(calls[0].attribution.fbclid,'new');assert.equal(calls[0].attribution.gclid,'google-click');assert.equal(calls[0].attribution.fbp,'fb.1.100.browser');
+const first=JSON.parse(map.get('fs_attribution_data'));assert.match(first.fbc,/\.new$/);await win.fetch('https://api.flexiblest.io/api/paypro-funnel-session',{body:JSON.stringify({action:'create'})});assert.equal(calls[0].attribution.fbc,first.fbc);assert.equal(calls[0].attribution.fbclid,'new');assert.equal(calls[0].attribution.gclid,'');assert.equal(calls[0].attribution.fbp,'fb.1.100.browser');
 let src='https://store.payproglobal.com/checkout?products[1][id]=133559&x-fbc='+encodeURIComponent(first.fbc),writes=0;const frame={nodeType:1,tagName:'IFRAME',isConnected:false,getAttribute:()=>src,setAttribute:(k,v)=>{src=v;writes++}};new Node().appendChild(frame);new Node().appendChild(frame);assert.equal(writes,1);assert.equal(new URL(src).searchParams.get('x-fbc'),first.fbc);
 });
-test('identical resolver in both bridges and checkout prevents divergent click rules',()=>{const extract=name=>{const s=fs.readFileSync(new URL('../webflow/'+name,import.meta.url),'utf8');return s.slice(s.indexOf('function resolveFacebookClick('),s.indexOf('\n  }',s.indexOf('function resolveFacebookClick('))+4)};assert.equal(extract('sales-bridge.js'),extract('checkout-bridge.js'));assert.equal(extract('sales-bridge.js'),extract('checkout-inline.js'));});
+test('identical resolver in both bridges and checkout prevents divergent click rules',()=>{const extract=name=>{const s=fs.readFileSync(new URL('../webflow/'+name,import.meta.url),'utf8');return s.slice(s.indexOf('function resolveFacebookClick('),s.indexOf('\n  }',s.indexOf('function resolveFacebookClick('))+4)};assert.equal(extract('sales-bridge.js'),extract('checkout-bridge.js'));assert.ok(fs.readFileSync(new URL('../webflow/checkout-inline.js',import.meta.url),'utf8').includes('stored.fs_touch_id ? {fbclid:stored.fbclid')); });
 test('blocked persistent storage does not continually regenerate the click timestamp',()=>{
 const src=fs.readFileSync(new URL('../webflow/sales-bridge.js',import.meta.url),'utf8');const start=src.indexOf('function resolveFacebookClick('),end=src.indexOf('\n  }',start)+4;let now=100;
 const c=vm.createContext({Date:{now:()=>now++}});vm.runInContext(src.slice(start,end)+'\nthis.resolve=resolveFacebookClick',c);
@@ -43,3 +43,4 @@ const win={location:{origin:'https://flexiblest.com',pathname:'/secure-checkout'
 const c=vm.createContext({window:win,document:doc,Node,URL,URLSearchParams,Promise,Date,console});vm.runInContext(fs.readFileSync(new URL('../webflow/checkout-bridge.js',import.meta.url),'utf8'),c);await win.fetch('https://api.flexiblest.io/api/paypro-funnel-session',{body:JSON.stringify({action:'create'})});assert.match(request.attribution.fbc,/\.click$/);
 });
 test('newer cookie on return visit is not overwritten by an older coherent stored pair',()=>{const c=checkout({fbclid:'old',fbc:'fb.1.100.old'},'_fbc=fb.1.200.new');assert.equal(c.get().fbclid,'new');assert.equal(c.get().fbc,'fb.1.200.new');assert.equal(c.writes(),0);});
+

@@ -76,6 +76,7 @@
     "https://api.flexiblest.io/api/paypro-funnel-session";
   var PAYPRO_HOST = "store.payproglobal.com";
   var DATA_KEYS = [
+    "fs_touch_id", "fs_touch_at", "fs_previous_paid_touch", "comet_campaign", "comet_ad_group", "comet_keyword",
     "comet_token",
     "comet_fingerprint",
     "comet_source",
@@ -162,7 +163,7 @@
     SAFE_CONTEXT_KEYS.forEach(function (key) {
       var item = SAFE_URL_KEYS[key]
         ? safePageUrl(source[key])
-        : clean(source[key]);
+        : key === "fs_previous_paid_touch" ? String(source[key] || "").slice(0, 8000) : clean(source[key]);
 
       if (item) {
         result[key] = item;
@@ -218,6 +219,41 @@
     var stored = readStored();
     var params = new URLSearchParams(window.location.search);
     var next = Object.assign({}, stored);
+    var touchKeys = ["fbclid","fbc","gclid","gbraid","wbraid","ttclid","cometly_click_id",
+      "comet_source","comet_ad_id","comet_placement","site_source_name","ad_id","placement",
+      "utm_source","utm_medium","utm_campaign","utm_content","utm_term","campaign_id","adset_id",
+      "comet_campaign","comet_ad_group","comet_keyword"];
+    var incoming = {};
+    touchKeys.forEach(function(key) { var v=clean(params.get(key)); if(v) incoming[key]=v; });
+    var changed = ["fbclid","gclid","gbraid","wbraid","ttclid","comet_ad_id","ad_id","utm_source","comet_source"]
+      .some(function(key) { return incoming[key] && incoming[key] !== stored[key]; });
+    var touchTime=Date.parse(stored.fs_touch_at || stored.updated_at || "");
+    var expired=Number.isFinite(touchTime) && Date.now()-touchTime>30*86400000;
+    var cookieFbc = "";
+    try {
+      var match = String(document.cookie || "").match(/(?:^|;\s*)_fbc=([^;]*)/);
+      if (match) cookieFbc = decodeURIComponent(match[1]);
+    } catch (error) {}
+    var cookieTime=Number((cookieFbc.match(/^fb\.\d+\.(\d+)\./)||[])[1]);
+    // An older Facebook cookie cannot attach itself to a newer non-Facebook
+    // visit. A genuinely newer cookie starts its own coherent touch.
+    var allowCookie=!changed && !expired && (!stored.fs_touch_id || stored.fbclid || cookieTime>touchTime);
+    var facebookClick=resolveFacebookClick(params.get("fbclid"), (changed||expired)?"":stored.fbclid,
+      allowCookie?cookieFbc:"", (changed||expired)?"":stored.fbc);
+    if(facebookClick.fbclid && facebookClick.fbclid!==stored.fbclid) changed=true;
+    if(changed || expired) {
+      if(!expired && (stored.comet_ad_id || stored.ad_id)) {
+        var prior={}; touchKeys.forEach(function(key) {if(stored[key]) prior[key]=stored[key];});
+        prior.captured_at=stored.fs_touch_at || stored.updated_at || "";
+        next.fs_previous_paid_touch=JSON.stringify(prior);
+      }
+      if(expired) delete next.fs_previous_paid_touch;
+      touchKeys.forEach(function(key) { delete next[key]; });
+      next.fs_touch_at=new Date().toISOString();
+      next.fs_touch_id="touch-"+Date.now()+"-"+Math.random().toString(36).slice(2);
+      next.landing_page_url=pageUrl();
+    }
+    if(!next.fs_touch_id) {next.fs_touch_id="touch-"+Date.now()+"-"+Math.random().toString(36).slice(2);next.fs_touch_at=new Date().toISOString();}
     var aliases = {
       comet_token: ["comet_token", "cometly_token"],
       comet_fingerprint: ["comet_fingerprint", "cometly_fingerprint", "fingerprint"],
@@ -240,14 +276,6 @@
       }
     });
 
-    // Keep the click and its fbc consistent before any session/iframe capture.
-    // Only read existing cookies here; cookie writing remains in checkout.
-    var cookieFbc = "";
-    try {
-      var match = String(document.cookie || "").match(/(?:^|;\s*)_fbc=([^;]*)/);
-      if (match) cookieFbc = decodeURIComponent(match[1]);
-    } catch (error) {}
-    var facebookClick = resolveFacebookClick(params.get("fbclid"), stored.fbclid, cookieFbc, stored.fbc);
     next.fbclid = facebookClick.fbclid;
     next.fbc = facebookClick.fbc;
 
@@ -275,6 +303,7 @@
       clean(stored.first_referrer) || safePageUrl(document.referrer);
     next.updated_at = new Date().toISOString();
 
+    touchKeys.forEach(function(key) {if(!next[key]) next[key]="";});
     writeStored(next);
     return next;
   }
@@ -282,6 +311,7 @@
   var pixelFingerprint = "";
   var fingerprintPending = false;
   var attribution = captureAttribution();
+  window.fsCaptureCoherentAttribution = captureAttribution;
   var lastSavedAttribution = "";
   var savePending = false;
   var retryAfter = 0;
@@ -399,19 +429,11 @@
       }
 
       // Only non-personal ad metadata is added to the PayPro URL.
-      [
-        ["x-comet_token", attribution.comet_token],
-        ["x-comet_fingerprint", attribution.comet_fingerprint],
-        ["x-comet_source", attribution.comet_source],
-        ["x-comet_ad_id", attribution.comet_ad_id],
-        ["x-comet_placement", attribution.comet_placement],
-        ["x-site_source_name", attribution.site_source_name],
-        ["x-ad_id", attribution.ad_id],
-        ["x-placement", attribution.placement]
-      ].forEach(function (entry) {
-        if (entry[1] && !url.searchParams.get(entry[0])) {
-          url.searchParams.set(entry[0], clean(entry[1]));
-        }
+      DATA_KEYS.forEach(function(key) {
+        if(key === "fs_previous_paid_touch") return;
+        var value=attribution[key];
+        if(value) url.searchParams.set("x-"+key,clean(value));
+        else if(attribution.fs_touch_id) url.searchParams.delete("x-"+key);
       });
 
       // Only write the attribute when attribution actually changed it.
@@ -467,7 +489,9 @@
           ? Object.assign({}, payload, attribution)
           : payload;
 
-      return nativeComet.call(this, eventName, nextPayload);
+      var args = Array.prototype.slice.call(arguments);
+      args[1] = nextPayload;
+      return nativeComet.apply(this, args);
     };
 
     wrappedComet.__flexiblestAttributionBridge = true;

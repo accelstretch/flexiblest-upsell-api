@@ -1,4 +1,4 @@
 {
-  "crons": [{"path": "/api/openai-conversions-worker", "schedule": "*/5 * * * *"}],
-  "functions": {"api/openai-conversions-worker.js": {"maxDuration": 300}}
+  "crons": [{"path": "/api/openai-conversions-worker", "schedule": "*/5 * * * *"}, {"path": "/api/paypro-recovery-worker", "schedule": "*/5 * * * *"}],
+  "functions": {"api/openai-conversions-worker.js": {"maxDuration": 300}, "api/paypro-recovery-worker.js": {"maxDuration": 300}, "api/paypro-webhook.js": {"maxDuration": 300}}
 }
