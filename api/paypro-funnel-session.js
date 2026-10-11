@@ -317,6 +317,12 @@ function sanitizeAttribution(body) {
   }
 
   const fields = {
+    fs_touch_id: clean(valueFor("fs_touch_id"), 200),
+    fs_touch_at: clean(valueFor("fs_touch_at"), 100),
+    fs_previous_paid_touch: clean(valueFor("fs_previous_paid_touch"), 8000),
+    comet_campaign: clean(valueFor("comet_campaign"), 500),
+    comet_ad_group: clean(valueFor("comet_ad_group"), 500),
+    comet_keyword: clean(valueFor("comet_keyword"), 500),
     comet_token: clean(
       valueFor("comet_token", "cometly_token"),
       1000
@@ -529,6 +535,11 @@ if ARGV[6] ~= "" and ARGV[6] ~= "{}" then
   if attributionOk and type(incomingAttribution) == "table" then
     if type(session["attribution"]) ~= "table" then
       session["attribution"] = {}
+    end
+
+    if incomingAttribution["fs_touch_id"] and incomingAttribution["fs_touch_id"] ~= session["attribution"]["fs_touch_id"] then
+      local old = session["attribution"]
+      session["attribution"] = {comet_token=old["comet_token"], comet_fingerprint=old["comet_fingerprint"], fbp=old["fbp"]}
     end
 
     for key, value in pairs(incomingAttribution) do
@@ -790,3 +801,4 @@ export default async function handler(req, res) {
     });
   }
 }
+

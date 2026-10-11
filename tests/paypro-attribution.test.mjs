@@ -6,7 +6,7 @@ import vm from 'node:vm';
 import crypto from 'node:crypto';
 import {selectVisitorIp, getBrowserRequestIp} from '../lib/visitor-ip.js';
 function load(path, names, overrides={}) {
- const code=fs.readFileSync(new URL(path,import.meta.url),'utf8').replace(/import\s+[\s\S]*?from\s+['"][^'"]+['"];?/g,'').replace(/export default /g,'');
+ const code=fs.readFileSync(new URL(path,import.meta.url),'utf8').replace(/import\s+[\s\S]*?from\s+['"][^'"]+['"];?/g,'').replace(/export default /g,'').replace(/export (?=async function|function|const)/g,'');
  const ctx=vm.createContext({process,URL,Buffer,console,crypto,sanitizeOpenAI,selectVisitorIp,getBrowserRequestIp,...crypto,...overrides});
  vm.runInContext(code+'\nthis.exposed={'+names.join(',')+'}',ctx);
  return ctx.exposed;
@@ -78,3 +78,4 @@ test('late attribution endpoint authenticates, preserves identity, and rejects c
  session.status='paid';assert.equal((await call()).code,409);assert.equal(commands.filter(c=>c[0]==='EVAL').length,1);
  session.status='created';assert.equal((await call(token,{action:'save_checkout_email',email:''})).code,400);
 });
+
