@@ -33,7 +33,8 @@ for i=2,#ARGV do
   redis.call('ZADD',KEYS[1],'NX',0,ARGV[i])
  end
 end
-redis.call('SET',KEYS[2],ARGV[1])
+local previous=tonumber(redis.call('GET',KEYS[2]) or '0')
+if tonumber(ARGV[1]) > previous then redis.call('SET',KEYS[2],ARGV[1]) end
 return #ARGV-1`;
 export default async function handler(req,res) {
   res.setHeader('Cache-Control','no-store');

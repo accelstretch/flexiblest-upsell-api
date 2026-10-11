@@ -1846,6 +1846,12 @@ async function processKajabiAccess(data) {
   }
 
   try {
+    // A competing request may have completed between our first read and lock.
+    const underLock=parseStoredRecord(await redisCommand(["GET",sentKey]));
+    if(underLock?.delivered === true) {
+      await releaseLock(lockKey,lockToken);
+      return {applicable:true,action,delivered:true,alreadyDelivered:true,offerId:offer.offerId};
+    }
     const controller = new AbortController();
     const timeoutId = setTimeout(
       () => controller.abort(),
@@ -1992,6 +1998,12 @@ async function sendCometlyEvent(event) {
   }
 
   try {
+    // A competing request may have completed between our first read and lock.
+    const underLock=parseStoredRecord(await redisCommand(["GET",sentKey]));
+    if(underLock?.sent === true) {
+      await releaseLock(lockKey,lockToken);
+      return {sent:true,alreadySent:true};
+    }
     const controller = new AbortController();
 
     const timeoutId = setTimeout(
