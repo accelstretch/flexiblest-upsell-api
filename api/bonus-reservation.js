@@ -1,6 +1,6 @@
 import crypto from "crypto";
 
-const BONUS_RESERVATION_SECONDS = 5 * 60 * 60 + 47 * 60 + 23;
+const BONUS_RESERVATION_SECONDS = 14 * 60 * 60 + 50 * 60 + 32;
 const RECORD_TTL_SECONDS = 30 * 24 * 60 * 60;
 const LEGACY_COOKIE_NAME = "fs_bonus_reservation";
 

@@ -101,8 +101,8 @@ async function testLegacyPagesShareAndRenewOneReservation() {
   assert.match(salesPage.headers.get("set-cookie"), /HttpOnly; Secure; SameSite=Lax/);
   assert.match(salesPage.body.reservation_id, /^br_[a-f0-9]{32}$/);
   assert.equal(salesPage.body.status, "active");
-  assert.equal(salesPage.body.duration_seconds, 20843);
-  assert.equal(salesPage.body.expires_at_ms - Date.parse(salesPage.body.cycle_started_at), 20843000);
+  assert.equal(salesPage.body.duration_seconds, 53432);
+  assert.equal(salesPage.body.expires_at_ms - Date.parse(salesPage.body.cycle_started_at), 53432000);
   assert.equal(salesPage.body.expires_at, salesPage.body.expires_at_ms);
 
   const cookie = cookiePair(salesPage.headers.get("set-cookie"));
@@ -133,7 +133,7 @@ async function testLegacyPagesShareAndRenewOneReservation() {
   assert.equal(restartedSalesPage.body.reservation_id, salesPage.body.reservation_id);
   assert.equal(restartedSalesPage.body.cycle_number, 2);
   assert.equal(restartedSalesPage.body.renewed, true);
-  assert.equal(restartedSalesPage.body.expires_at_ms - Date.parse(restartedSalesPage.body.cycle_started_at), 20843000);
+  assert.equal(restartedSalesPage.body.expires_at_ms - Date.parse(restartedSalesPage.body.cycle_started_at), 53432000);
   assert.ok(restartedSalesPage.body.expires_at_ms > Date.now());
 }
 
@@ -146,8 +146,8 @@ async function testBearerClientStillWorks() {
   });
 
   assert.equal(created.statusCode, 201);
-  assert.equal(created.body.duration_seconds, 20843);
-  assert.equal(created.body.expires_at_ms - Date.parse(created.body.cycle_started_at), 20843000);
+  assert.equal(created.body.duration_seconds, 53432);
+  assert.equal(created.body.expires_at_ms - Date.parse(created.body.cycle_started_at), 53432000);
   assert.match(created.body.access_token, /^[A-Za-z0-9_-]{20,512}$/);
 
   const status = await callHandler({
