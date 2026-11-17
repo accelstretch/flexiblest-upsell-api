@@ -77,13 +77,13 @@ const KAJABI_PRODUCT_OFFERS = {
 const REFERENCE_CHARGE_OFFERS = {
   "133573": {
     offerKey: "fasttrack57",
-    amount: 57,
+    amount: 39,
     currency: "USD"
   },
 
   "133574": {
     offerKey: "fasttrack37",
-    amount: 37,
+    amount: 29,
     currency: "USD"
   }
 };

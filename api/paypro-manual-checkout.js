@@ -11,14 +11,14 @@ const MAX_REQUEST_BODY_BYTES = 8 * 1024;
 const OFFERS = {
   fasttrack57: {
     productId: 133573,
-    amount: 57,
+    amount: 39,
     currency: "USD",
     offerStep: "upsell_fasttrack57"
   },
 
   fasttrack37: {
     productId: 133574,
-    amount: 37,
+    amount: 29,
     currency: "USD",
     offerStep: "downsell_fasttrack37"
   }

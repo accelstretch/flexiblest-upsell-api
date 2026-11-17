@@ -42,6 +42,10 @@ test('upsell retains event type, amount, deduplication and identifiers',()=>{
  const e=event({comet_ad_id:'120249186591430576',comet_token:'token-real',comet_fingerprint:'fingerprint-real'},{PRODUCT_ID:'133573',ORDER_TOTAL_AMOUNT:'57',ORDER_ITEM_TOTAL_AMOUNT:'57'},'upsell');
  assert.equal(e.event_name,'custom_event_1');assert.equal(e.amount,57);assert.equal(e.idempotency_key,'paypro-90000001-133573');assert.equal(e.fingerprint,'fingerprint-real');
 });
+for (const [product, amount] of [['133573',39],['133574',29],['133573',57],['133574',37]]) test('upsell reports actual paid amount '+product+'/'+amount,()=>{
+ const e=event({}, {PRODUCT_ID:product,ORDER_TOTAL_AMOUNT:String(amount),ORDER_ITEM_TOTAL_AMOUNT:String(amount)},'upsell');
+ assert.equal(e.amount,amount);assert.equal(e.event_name,'custom_event_1');
+});
 for(const page of ['sales','checkout']) test(page+' bridge refreshes delayed identity without reloading payment iframe',async()=>{
  const calls=[],intervals=[],local=new Map(),session=new Map();
  const storage=m=>({getItem:k=>m.get(k)||null,setItem:(k,v)=>m.set(k,v)});

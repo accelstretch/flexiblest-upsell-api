@@ -27,6 +27,7 @@ process.env.COMETLY_API_KEY = "cometly-test";
 const redis = new Map();
 let payProResponse = null;
 let payProCallCount = 0;
+let lastPayProPayload = null;
 
 function parseJson(value) {
   if (!value) {
@@ -138,6 +139,7 @@ global.fetch = async function mockFetch(url, options = {}) {
     "https://store.payproglobal.com/api/Orders/DoReferenceCharge"
   ) {
     payProCallCount += 1;
+    lastPayProPayload = JSON.parse(options.body);
 
     return new Response(JSON.stringify(payProResponse), {
       status: 200,
@@ -243,7 +245,7 @@ async function sendUpsellIpn(
   {
     orderId = "800001",
     productId = "133573",
-    amount = "57"
+    amount = "39"
   } = {}
 ) {
   const body = {
@@ -306,6 +308,8 @@ async function testIpnAuthoritativeCharge() {
   const initial = await callReferenceCharge("charge");
 
   assert.equal(initial.statusCode, 202);
+  assert.equal(lastPayProPayload.priceValue, 39);
+  assert.equal(initial.body.amount, 39);
   assert.equal(initial.body.processing, true);
   assert.equal(initial.body.charged, false);
   assert.equal(payProCallCount, 1);
@@ -332,6 +336,7 @@ async function testIpnAuthoritativeCharge() {
   assert.equal(confirmedStatus.statusCode, 200);
   assert.equal(confirmedStatus.body.confirmed, true);
   assert.equal(confirmedStatus.body.charged, true);
+  assert.equal(confirmedStatus.body.amount, 39);
   assert.equal(payProCallCount, 1);
 }
 
@@ -362,6 +367,7 @@ async function testManualFallback() {
 
   assert.equal(manualCheckout.statusCode, 200);
   assert.equal(manualCheckout.body.confirmed, false);
+  assert.equal(manualCheckout.body.amount, 39);
   assert.match(
     manualCheckout.body.checkout_url,
     /^https:\/\/store\.payproglobal\.com\/checkout\?/
@@ -460,7 +466,8 @@ async function testFinalOfferUsesItsOwnOrder() {
 
   assert.equal(failedReferenceCharge.statusCode, 200);
   assert.equal(failedReferenceCharge.body.fallback, true);
-  assert.equal(failedReferenceCharge.body.amount, 37);
+  assert.equal(failedReferenceCharge.body.amount, 29);
+  assert.equal(lastPayProPayload.priceValue, 29);
 
   const fallbackToken =
     failedReferenceCharge.body.fallback_token;
@@ -470,7 +477,7 @@ async function testFinalOfferUsesItsOwnOrder() {
 
   assert.equal(manualCheckout.statusCode, 200);
   assert.equal(manualCheckout.body.product_id, 133574);
-  assert.equal(manualCheckout.body.amount, 37);
+  assert.equal(manualCheckout.body.amount, 29);
   assert.match(
     manualCheckout.body.checkout_url,
     /products%5B1%5D%5Bid%5D=133574/
@@ -484,7 +491,7 @@ async function testFinalOfferUsesItsOwnOrder() {
     {
       orderId: "800037",
       productId: "133574",
-      amount: "37"
+      amount: "29"
     }
   );
 
@@ -497,7 +504,7 @@ async function testFinalOfferUsesItsOwnOrder() {
 
   assert.equal(confirmedStatus.statusCode, 200);
   assert.equal(confirmedStatus.body.confirmed, true);
-  assert.equal(confirmedStatus.body.amount, 37);
+  assert.equal(confirmedStatus.body.amount, 29);
   assert.equal(payProCallCount, 1);
 }
 
